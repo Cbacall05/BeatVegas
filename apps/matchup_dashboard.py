@@ -9,12 +9,13 @@ from typing import Iterable, Sequence
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
-from beat_vegas import data_load, models
+from beat_vegas import data_load, models, player_models
 from matchup_predictor import (
     build_game_level_dataset,
     build_team_game_records,
@@ -148,6 +149,12 @@ def load_schedule_cached(seasons: tuple[int, ...]) -> pd.DataFrame:
     return data_load.load_schedule(list(seasons))
 
 
+@st.cache_data(show_spinner=False)
+def load_pbp_cached(seasons: tuple[int, ...]) -> pd.DataFrame:
+    cache_dir = ROOT_DIR / "data" / "pbp"
+    return data_load.load_play_by_play(list(seasons), cache_dir=cache_dir)
+
+
 @st.cache_resource(show_spinner=False)
 def train_models(
     train_seasons: tuple[int, ...],
@@ -203,6 +210,30 @@ def build_upcoming_predictions(
     if "game_date" in predictions.columns:
         predictions["game_date"] = pd.to_datetime(predictions["game_date"])
     return predictions
+
+
+def build_player_prop_predictions(
+    schedule_df: pd.DataFrame,
+    train_seasons: tuple[int, ...],
+    validation_season: int,
+    week: int,
+    lookback: int = 4,
+) -> tuple[pd.DataFrame, dict[str, float] | None, str | None]:
+    seasons_for_pbp = tuple(sorted(set(train_seasons + (validation_season,))))
+    try:
+        pbp_df = load_pbp_cached(seasons_for_pbp)
+        model_result, _, upcoming = player_models.train_and_predict_touchdowns(
+            schedule_df,
+            pbp_df,
+            seasons=seasons_for_pbp,
+            target_season=validation_season,
+            target_week=week,
+            lookback=lookback,
+            min_touches=0.75,
+        )
+        return upcoming, model_result.metrics, None
+    except Exception as exc:  # noqa: BLE001 - surface to UI
+        return pd.DataFrame(), None, str(exc)
 
 
 def render_header():
@@ -375,6 +406,284 @@ def render_metrics(predictions: pd.DataFrame, team_filter: list[str]):
     st.dataframe(formatted, use_container_width=True)
 
 
+def render_totals_section(predictions: pd.DataFrame):
+    if predictions.empty:
+        st.info("No totals predictions available for the current filters.")
+        return
+
+    model_total_cols = [col for col in predictions.columns if col.endswith("_total") and col != "market_total"]
+    if not model_total_cols:
+        st.info("Totals models are not available for this configuration.")
+        return
+
+    st.markdown("### Total Points Outlook")
+
+    totals_cols = [
+        "game_id",
+        "week",
+        "home_team",
+        "away_team",
+        "avg_total_pred",
+        "avg_total_std",
+        "ensemble_total_low",
+        "ensemble_total_high",
+        "ensemble_total_p25",
+        "ensemble_total_p75",
+        "market_total",
+    ]
+    totals_cols = [col for col in totals_cols if col in predictions.columns]
+
+    totals_view = predictions[totals_cols].copy()
+    if {"avg_total_pred", "market_total"}.issubset(totals_view.columns):
+        totals_view["total_edge"] = totals_view["avg_total_pred"] - totals_view["market_total"]
+
+    numeric_cols = [
+        "avg_total_pred",
+        "avg_total_std",
+        "ensemble_total_low",
+        "ensemble_total_high",
+        "ensemble_total_p25",
+        "ensemble_total_p75",
+        "market_total",
+        "total_edge",
+    ]
+    for col in numeric_cols:
+        if col in totals_view.columns:
+            totals_view[col] = totals_view[col].astype(float).round(2)
+
+    st.dataframe(
+        totals_view.rename(
+            columns={
+                "week": "Week",
+                "home_team": "Home",
+                "away_team": "Away",
+                "avg_total_pred": "Ensemble Total",
+                "avg_total_std": "Std Dev",
+                "ensemble_total_low": "68% Low",
+                "ensemble_total_high": "68% High",
+                "ensemble_total_p25": "25th %",
+                "ensemble_total_p75": "75th %",
+                "market_total": "Market Total",
+                "total_edge": "Edge vs Market",
+            }
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    annotated = predictions.reset_index().copy()
+    if annotated.empty:
+        return
+
+    def _matchup_label(row: pd.Series) -> str:
+        week = int(row.get("week", 0))
+        game_id = row.get("game_id", "")
+        return f"Week {week}: {row['away_team']} @ {row['home_team']} ({game_id})"
+
+    option_pairs = [(row["index"], _matchup_label(row)) for _, row in annotated.iterrows()]
+    labels = [label for _, label in option_pairs]
+    selection = st.selectbox("Drill into a matchup", options=labels)
+    selected_index = next(idx for idx, label in option_pairs if label == selection)
+    selected_row = predictions.loc[selected_index]
+
+    mean_total = float(selected_row.get("avg_total_pred", np.nan))
+    std_total = selected_row.get("avg_total_std", np.nan)
+    if pd.isna(mean_total) and model_total_cols:
+        model_values = selected_row[model_total_cols].dropna().astype(float)
+        if not model_values.empty:
+            mean_total = float(model_values.mean())
+    if pd.isna(std_total) or std_total <= 0:
+        model_values = selected_row[model_total_cols].dropna().astype(float)
+        if len(model_values) > 1:
+            std_total = float(model_values.std(ddof=0))
+
+    market_total = selected_row.get("market_total", np.nan)
+
+    if pd.isna(mean_total) or pd.isna(std_total) or std_total <= 0:
+        st.warning("Insufficient variance data to plot a total-points distribution for this matchup.")
+    else:
+        std_total = float(std_total)
+        spread = 3 * std_total
+        xs = np.linspace(mean_total - spread, mean_total + spread, 200)
+        pdf = (1 / (std_total * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((xs - mean_total) / std_total) ** 2)
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(
+                x=xs,
+                y=pdf,
+                mode="lines",
+                line=dict(color="#2563eb", width=3),
+                fill="tozeroy",
+                name="Ensemble PDF",
+            )
+        )
+        fig.add_vline(x=mean_total, line_width=2, line_dash="dash", line_color="#2563eb")
+        if pd.notna(market_total):
+            fig.add_vline(x=float(market_total), line_width=2, line_dash="dot", line_color="#f59e0b")
+        fig.update_layout(
+            title="Projected Total Distribution",
+            xaxis_title="Total Points",
+            yaxis_title="Density",
+            margin=dict(l=20, r=20, t=40, b=20),
+            height=320,
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        col_mean, col_std, col_edge = st.columns(3)
+        col_mean.metric("Ensemble Total", f"{mean_total:.1f}")
+        col_std.metric("Std Dev", f"{std_total:.2f}")
+        if pd.notna(market_total):
+            delta = mean_total - float(market_total)
+            col_edge.metric("Edge vs Market", f"{delta:+.1f}")
+
+    per_model_rows: list[dict[str, float | str | None]] = []
+    for col in model_total_cols:
+        model_name = col.removesuffix("_total")
+        prediction_val = selected_row.get(col)
+        residual_std_val = selected_row.get(f"{model_name}_total_std")
+        per_model_rows.append(
+            {
+                "Model": model_name,
+                "Prediction": float(prediction_val) if pd.notna(prediction_val) else None,
+                "Residual Std": float(residual_std_val) if pd.notna(residual_std_val) else None,
+                "Edge vs Market": float(prediction_val - market_total)
+                if pd.notna(prediction_val) and pd.notna(market_total)
+                else None,
+            }
+        )
+
+    per_model_df = pd.DataFrame(per_model_rows)
+    if not per_model_df.empty:
+        for col in ["Prediction", "Residual Std", "Edge vs Market"]:
+            if col in per_model_df:
+                per_model_df[col] = per_model_df[col].astype(float).round(2)
+        st.markdown("#### Model Breakdown")
+        st.dataframe(per_model_df, hide_index=True, use_container_width=True)
+
+
+def render_player_props(
+    player_props: pd.DataFrame,
+    schedule_df: pd.DataFrame,
+    validation_season: int,
+    week: int,
+    metrics: dict[str, float] | None,
+    error: str | None,
+):
+    st.markdown("### Player Touchdown Probabilities")
+
+    if error is not None:
+        st.warning(f"Touchdown model unavailable: {error}")
+        return
+
+    if player_props.empty:
+        st.info(
+            "Touchdown projections will appear here once sufficient history is available for the selected matchup window."
+        )
+        return
+
+    if metrics:
+        cols = st.columns(3)
+        auc = metrics.get("auc")
+        avg_precision = metrics.get("average_precision")
+        base_rate = metrics.get("base_rate")
+        cols[0].metric("Model AUC", f"{auc:.3f}" if isinstance(auc, float) and not np.isnan(auc) else "–")
+        cols[1].metric(
+            "Average Precision",
+            f"{avg_precision:.3f}" if isinstance(avg_precision, float) and not np.isnan(avg_precision) else "–",
+        )
+        cols[2].metric(
+            "Base TD Rate",
+            f"{base_rate:.2%}" if isinstance(base_rate, float) and not np.isnan(base_rate) else "–",
+        )
+
+    upcoming_slice = schedule_df[
+        (schedule_df["season"] == validation_season)
+        & (schedule_df["week"] == week)
+    ][["game_id", "home_team", "away_team", "gameday"]].copy()
+    if upcoming_slice.empty:
+        st.info("No schedule entries available for the selected week.")
+        return
+
+    upcoming_slice["label"] = upcoming_slice.apply(
+        lambda row: f"Week {week}: {row['away_team']} @ {row['home_team']}", axis=1
+    )
+    options = upcoming_slice.sort_values("label")
+    selection = st.selectbox("Choose a matchup", options["label"].tolist())
+    selected_row = upcoming_slice.loc[upcoming_slice["label"] == selection].iloc[0]
+    selected_game_id = selected_row["game_id"]
+    home_team = selected_row["home_team"]
+    away_team = selected_row["away_team"]
+
+    game_players = player_props[player_props["game_id"] == selected_game_id].copy()
+    if game_players.empty:
+        st.info("No player projections found for the selected matchup.")
+        return
+
+    game_players["td_prob"] = game_players["touchdown_prob"].astype(float)
+    game_players["Touches"] = game_players["avg_total_touches"].map(lambda v: f"{v:.1f}")
+    game_players["Rush Att"] = game_players["avg_rush_attempts"].map(lambda v: f"{v:.1f}")
+    game_players["Targets"] = game_players["avg_targets"].map(lambda v: f"{v:.1f}")
+    game_players["Red Zone"] = game_players["avg_redzone_touches"].map(lambda v: f"{v:.1f}")
+    game_players["TD %"] = game_players["td_prob"].map(_format_prob)
+
+    home_df = (
+        game_players[game_players["team"] == home_team]
+        .sort_values("td_prob", ascending=False)
+        .head(8)
+    )
+    away_df = (
+        game_players[game_players["team"] == away_team]
+        .sort_values("td_prob", ascending=False)
+        .head(8)
+    )
+
+    st.markdown("#### Top Scorers")
+    cols = st.columns(2)
+    cols[0].markdown(f"**{home_team} (Home)**")
+    cols[0].dataframe(
+        home_df[["player_display_name", "position", "TD %", "Touches", "Rush Att", "Targets", "Red Zone"]]
+        .rename(columns={"player_display_name": "Player", "position": "Pos"}),
+        hide_index=True,
+        use_container_width=True,
+    )
+    cols[1].markdown(f"**{away_team} (Away)**")
+    cols[1].dataframe(
+        away_df[["player_display_name", "position", "TD %", "Touches", "Rush Att", "Targets", "Red Zone"]]
+        .rename(columns={"player_display_name": "Player", "position": "Pos"}),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    st.markdown("#### Probability Landscape")
+    chart_df = game_players.sort_values("td_prob", ascending=True).tail(12)
+    palette = {home_team: "#1d428a", away_team: "#c8102e"}
+    colors = [palette.get(team, "#4b5563") for team in chart_df["team"]]
+    fig = go.Figure(
+        go.Bar(
+            x=chart_df["td_prob"],
+            y=chart_df["player_display_name"],
+            orientation="h",
+            text=chart_df["td_prob"].map(lambda v: f"{v:.1%}"),
+            marker_color=colors,
+            customdata=np.column_stack([chart_df["team"], chart_df["position"]]),
+            hovertemplate="%{y} (%{customdata[0]}) — %{customdata[1]} | %{x:.1%}<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        yaxis=dict(autorange="reversed"),
+        xaxis=dict(title="Touchdown Probability"),
+        height=460,
+        margin=dict(l=90, r=20, t=30, b=40),
+        showlegend=False,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.caption(
+        "Probabilities reflect the chance that a player scores at least one touchdown, driven by recent usage trends and the upcoming game's market total."
+    )
+
 def main() -> None:
     render_header()
     train_seasons, validation_season, rolling_window, week, team_filter = render_sidebar()
@@ -400,7 +709,29 @@ def main() -> None:
             week=week,
         )
 
-    render_metrics(predictions, team_filter)
+    player_props, player_metrics, player_error = build_player_prop_predictions(
+        schedule_df,
+        train_seasons,
+        validation_season,
+        week,
+        lookback=4,
+    )
+
+    matchups_tab, totals_tab, props_tab = st.tabs(["Matchups", "Totals", "Player Props"])
+
+    with matchups_tab:
+        render_metrics(predictions, team_filter)
+    with totals_tab:
+        render_totals_section(predictions)
+    with props_tab:
+        render_player_props(
+            player_props,
+            schedule_df,
+            validation_season,
+            week,
+            player_metrics,
+            player_error,
+        )
 
     st.caption(
         "Model suite includes logistic regression, random forest, and LightGBM (if installed). Average win probabilities reflect the ensemble mean across available classifiers."

@@ -35,7 +35,7 @@ Beat Vegas is a streamlined NFL matchup studio that learns from historical sched
   streamlit run apps/matchup_dashboard.py
   ```
 
-  This opens a new browser tab with a sleek control panel to train models, inspect upcoming matchups, and visualize win probabilities. Adjust seasons, rolling windows, or highlight specific teams without touching the CLI.
+  This opens a new browser tab with a sleek control panel to train models, inspect upcoming matchups, visualize win probabilities, drill into total-point distributions, and dive into the Player Props lab for touchdown probabilities. Adjust seasons, rolling windows, or highlight specific teams without touching the CLI.
 
 5. **Explore the notebook**
 
@@ -46,7 +46,15 @@ Beat Vegas is a streamlined NFL matchup studio that learns from historical sched
 - **Historical training pipeline** – pulls schedules and odds from `nfl_data_py`, engineers rolling team strength features, and trains logistic/forest/LightGBM baselines for moneylines and totals.
 - **Matchup predictor CLI** – targets any home/away pairing, prints validation season context, and produces forward-looking win and total projections.
 - **Streamlit Matchup Studio** – interactive dashboard for selecting training seasons, tweaking rolling windows, spotlighting teams, and reviewing ensemble win probabilities in real time.
+- **Total distribution explorer** – ensemble mean/variance estimates for totals with per-model breakdowns, market edge deltas, and quick density plots for each matchup.
+- **Player touchdown lab** – per-game scorer probabilities built from recent usage, red-zone touches, and market totals, highlighting the most likely TD threats for both teams.
 - **Play-by-play cache ready** – parquet library under `data/pbp` makes it easy to plug in richer PBP-derived features when needed.
+
+## Player Props Lab
+
+- Jump into the **Player Props** tab inside the Streamlit dashboard to surface touchdown probabilities for every upcoming matchup.
+- Select a game to compare both teams’ top scorers, inspect their recent usage (touches, targets, red-zone looks), and review a probability leaderboard.
+- Probabilities come from a logistic model built on play-by-play usage trends blended with the market total, so high-volume players in rich scoring environments rise to the top.
 
 ## Architecture
 
@@ -55,6 +63,7 @@ beat_vegas/
   data_load.py    # Data ingestion, caching, schedule enrichment
   features.py     # Rolling/team strength features, game-level pivoting
   models.py       # Baseline models, metrics, mispricing detection
+  player_models.py# Player-level touchdown dataset + logistic ensemble
   visuals.py      # ND blue + gold plotting helpers
   pipeline.py     # High-level orchestration helpers
 configs/

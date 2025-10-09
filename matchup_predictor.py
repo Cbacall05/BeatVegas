@@ -281,9 +281,34 @@ def predict_upcoming_games(
             base[f"{result.model_name}_away_win"] = 1 - proba
             home_probs.append(proba)
 
+        total_preds: list[float] = []
+        total_stds: list[float] = []
         for result in totals_results:
             pred_total = float(result.model.predict(feature_frame)[0])
             base[f"{result.model_name}_total"] = pred_total
+            total_preds.append(pred_total)
+            residual_std = result.metrics.get("residual_std") if result.metrics else None
+            if residual_std is not None:
+                residual_std_f = float(residual_std)
+                base[f"{result.model_name}_total_std"] = residual_std_f
+                total_stds.append(residual_std_f)
+
+        ensemble_std: float | None = None
+        if total_preds:
+            avg_total = float(np.mean(total_preds))
+            base["avg_total_pred"] = avg_total
+            if total_stds:
+                ensemble_std = float(np.sqrt(np.mean(np.square(total_stds))))
+            elif len(total_preds) > 1:
+                ensemble_std = float(np.std(total_preds, ddof=0))
+
+        if ensemble_std is not None:
+            base["avg_total_std"] = ensemble_std
+            base["ensemble_total_low"] = float(avg_total - ensemble_std)
+            base["ensemble_total_high"] = float(avg_total + ensemble_std)
+            quartile_offset = 0.67448975 * ensemble_std
+            base["ensemble_total_p25"] = float(avg_total - quartile_offset)
+            base["ensemble_total_p75"] = float(avg_total + quartile_offset)
 
         if home_probs:
             avg_home = float(np.mean(home_probs))
@@ -327,7 +352,6 @@ def build_custom_matchup_row(
 
     if home_latest.empty or away_latest.empty:
         raise ValueError("Insufficient history for one or both teams. Try expanding the season range.")
-
     home_pref = home_latest.add_prefix("home_").reset_index(drop=True)
     away_pref = away_latest.add_prefix("away_").reset_index(drop=True)
     combined = pd.concat([home_pref, away_pref], axis=1)

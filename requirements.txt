@@ -8,3 +8,4 @@ seaborn>=0.13
 plotly>=5.18
 pyyaml>=6.0
 streamlit>=1.39
+statsmodels>=0.14

@@ -228,7 +228,10 @@ def train_total_models(
         reg = lgb.LGBMRegressor(**lgb_params)
         reg.fit(X_train, y_train, eval_set=[(X_val, y_val)], eval_metric="rmse")
         preds = reg.predict(X_val)
+        residuals = y_val.to_numpy() - preds
+        residual_std = float(np.std(residuals, ddof=1)) if residuals.size > 1 else float(np.std(residuals))
         metrics = _compute_regression_metrics(y_val.to_numpy(), preds)
+        metrics["residual_std"] = residual_std
         results.append(
             ModelResult(
                 model_name="lightgbm_totals",
@@ -254,7 +257,10 @@ def train_total_models(
     )
     linear.fit(X_train, y_train)
     preds = linear.predict(X_val)
+    residuals = y_val.to_numpy() - preds
+    residual_std = float(np.std(residuals, ddof=1)) if residuals.size > 1 else float(np.std(residuals))
     metrics = _compute_regression_metrics(y_val.to_numpy(), preds)
+    metrics["residual_std"] = residual_std
     results.append(
         ModelResult(
             model_name="linear_regression_totals",
@@ -279,7 +285,10 @@ def train_total_models(
     )
     rf.fit(X_train.fillna(0), y_train)
     preds = rf.predict(X_val.fillna(0))
+    residuals = y_val.to_numpy() - preds
+    residual_std = float(np.std(residuals, ddof=1)) if residuals.size > 1 else float(np.std(residuals))
     metrics = _compute_regression_metrics(y_val.to_numpy(), preds)
+    metrics["residual_std"] = residual_std
     results.append(
         ModelResult(
             model_name="random_forest_totals",
