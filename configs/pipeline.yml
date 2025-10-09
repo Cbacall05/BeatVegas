@@ -1,0 +1,18 @@
+seasons:
+  train: [2018, 2019, 2020, 2021]
+  validation: [2022]
+  test: [2023]
+
+features:
+  rolling_window: 4
+  include_matchup_diffs: true
+  include_team_strength: true
+
+models:
+  moneyline:
+    threshold_edge: 0.05
+  totals:
+    threshold_edge: 3.0
+
+cache:
+  pbp_dir: data/pbp
