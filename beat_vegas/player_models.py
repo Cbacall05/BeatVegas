@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
-from typing import Iterable
+from typing import Iterable, Optional
 
 import numpy as np
 import pandas as pd
@@ -13,6 +13,8 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 from . import data_load
 
 LOGGER = logging.getLogger(__name__)
+
+EXCLUDED_STATUSES = {"RET", "FA", "UFA", "CUT", "SUS"}
 
 
 @dataclass
@@ -26,6 +28,50 @@ class PlayerTouchdownModelResult:
     min_touches: float
     metrics: dict[str, float]
     training_frame: pd.DataFrame
+
+
+def _prepare_roster_lookup(
+    roster_df: Optional[pd.DataFrame],
+    *,
+    target_season: int,
+    target_week: int,
+) -> pd.DataFrame:
+    if roster_df is None or roster_df.empty:
+        return pd.DataFrame()
+
+    roster = roster_df.copy()
+    if "player_id" not in roster.columns and "gsis_id" in roster.columns:
+        roster["player_id"] = roster["gsis_id"]
+
+    player_id_col = "player_id" if "player_id" in roster.columns else None
+    if player_id_col is None:
+        return pd.DataFrame()
+
+    team_col = None
+    for candidate in ("team", "recent_team", "team_abbr"):
+        if candidate in roster.columns:
+            team_col = candidate
+            break
+    if team_col is None:
+        return pd.DataFrame()
+
+    roster = roster[roster[player_id_col].notna()].copy()
+    roster[team_col] = roster[team_col].astype(str).str.upper()
+
+    if "status" in roster.columns:
+        roster["status"] = roster["status"].astype(str).str.upper()
+        roster = roster[~roster["status"].isin(EXCLUDED_STATUSES)]
+
+    if "season" in roster.columns:
+        roster = roster[roster["season"] == target_season]
+
+    if "week" in roster.columns:
+        roster = roster[roster["week"] <= target_week]
+        roster = roster.sort_values([player_id_col, "week"]).drop_duplicates(player_id_col, keep="last")
+
+    roster = roster[[player_id_col, team_col]].drop_duplicates()
+    roster.rename(columns={player_id_col: "player_id", team_col: "team"}, inplace=True)
+    return roster
 
 
 def _safe_sum(series: pd.Series) -> float:
@@ -80,6 +126,13 @@ def build_player_game_stats(pbp_df: pd.DataFrame, schedule_df: pd.DataFrame) -> 
     if combined.empty:
         raise ValueError("No player rushing/receiving stats available in play-by-play dataframe.")
 
+    combined = combined[combined["player_id"].notna()].copy()
+    if "team" in combined:
+        combined = combined[combined["team"].str.upper() != "TOT"]
+    combined = combined[combined["player_name"].notna()]
+    combined = combined[combined["player_name"].str.strip() != ""]
+    combined = combined[~combined["player_name"].str.contains("error", case=False, na=False)]
+
     aggregations = {
         "player_name": "first",
         "position": "first",
@@ -130,6 +183,7 @@ def build_player_game_stats(pbp_df: pd.DataFrame, schedule_df: pd.DataFrame) -> 
     team_schedule = team_schedule[schedule_cols]
 
     player_stats = player_stats.merge(team_schedule, on=["season", "week", "game_id", "team"], how="left")
+    player_stats["player_id"] = player_stats["player_id"].astype(str)
     return player_stats
 
 
@@ -255,6 +309,7 @@ def _aggregate_recent_usage(
         return pd.DataFrame()
 
     history = history.sort_values(["player_id", "season", "week"])
+    history = history[history["team"].fillna("").str.upper() != "TOT"]
     recent = history.groupby("player_id", group_keys=False).tail(lookback)
     grouped = recent.groupby("player_id").agg(
         {
@@ -281,7 +336,9 @@ def _aggregate_recent_usage(
     }, inplace=True)
     grouped["avg_total_touches"] = grouped["avg_rush_attempts"].fillna(0.0) + grouped["avg_targets"].fillna(0.0)
     grouped = grouped[grouped["avg_total_touches"] >= min_touches]
-    return grouped.reset_index()
+    grouped = grouped.reset_index()
+    grouped["player_id"] = grouped["player_id"].astype(str)
+    return grouped
 
 
 def predict_upcoming_touchdowns(
@@ -291,6 +348,7 @@ def predict_upcoming_touchdowns(
     *,
     target_season: int,
     target_week: int,
+    roster_lookup: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """Generate touchdown probabilities for upcoming games using the trained model."""
 
@@ -325,6 +383,17 @@ def predict_upcoming_touchdowns(
     merged = usage.merge(upcoming, on="team", how="inner", suffixes=("", "_upcoming"))
     if merged.empty:
         return pd.DataFrame()
+
+    merged["player_id"] = merged["player_id"].astype(str)
+    merged["team"] = merged["team"].astype(str).str.upper()
+    if roster_lookup is not None and not roster_lookup.empty:
+        roster_lookup = roster_lookup.copy()
+        roster_lookup["team"] = roster_lookup["team"].astype(str).str.upper()
+        roster_lookup = roster_lookup.drop_duplicates(subset=["player_id", "team"])
+        merged = merged.merge(roster_lookup, on=["player_id", "team"], how="inner")
+        if merged.empty:
+            LOGGER.warning("No roster overlap found when filtering touchdown projections.")
+            return pd.DataFrame()
 
     positions = merged["position"].fillna("UNK").str.upper()
     for pos in ["RB", "WR", "TE", "QB"]:
@@ -363,6 +432,8 @@ def predict_upcoming_touchdowns(
         "market_total",
     ]
     result = merged[output_cols].copy()
+    result = result[result["touchdown_prob"].notna()]
+    result = result[result["touchdown_prob"] > 0]
     result.sort_values(["game_id", "touchdown_prob"], ascending=[True, False], inplace=True)
     return result.reset_index(drop=True)
 
@@ -376,6 +447,7 @@ def train_and_predict_touchdowns(
     target_week: int,
     lookback: int = 4,
     min_touches: float = 0.5,
+    roster_df: Optional[pd.DataFrame] = None,
 ) -> tuple[PlayerTouchdownModelResult, pd.DataFrame, pd.DataFrame]:
     """Convenience wrapper to train and generate upcoming touchdown probabilities."""
 
@@ -392,11 +464,18 @@ def train_and_predict_touchdowns(
         min_touches=min_touches,
     )
 
+    roster_lookup = _prepare_roster_lookup(
+        roster_df,
+        target_season=target_season,
+        target_week=target_week,
+    )
+
     upcoming = predict_upcoming_touchdowns(
         model_result,
         player_stats,
         schedule_df,
         target_season=target_season,
         target_week=target_week,
+        roster_lookup=roster_lookup,
     )
     return model_result, dataset, upcoming

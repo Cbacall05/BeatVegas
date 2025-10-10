@@ -12,10 +12,24 @@ from typing import Iterable, Optional
 
 import pandas as pd
 
+_NFL_IMPORT_ERROR: Optional[ImportError]
+
 try:  # Lazy import to keep module importable without dependency installed.
-    from nfl_data_py import import_pbp_data, import_schedules, import_weekly_data
-except ImportError:  # pragma: no cover - handled by runtime checks in getters below.
-    import_pbp_data = import_schedules = import_weekly_data = None
+    import nfl_data_py as _nfl_data_py
+    _NFL_IMPORT_ERROR = None
+except ImportError as exc:  # pragma: no cover - handled by runtime checks in getters below.
+    _nfl_data_py = None
+    _NFL_IMPORT_ERROR = exc
+
+if _nfl_data_py is not None:  # pragma: no branch - simple attribute lookups.
+    import_pbp_data = getattr(_nfl_data_py, "import_pbp_data", None)
+    import_schedules = getattr(_nfl_data_py, "import_schedules", None)
+    import_weekly_data = getattr(_nfl_data_py, "import_weekly_data", None)
+    import_rosters = getattr(_nfl_data_py, "import_rosters", None) or getattr(
+        _nfl_data_py, "import_seasonal_rosters", None
+    )
+else:
+    import_pbp_data = import_schedules = import_weekly_data = import_rosters = None
 
 
 def _ensure_nfl_data_py_available() -> None:
@@ -24,7 +38,14 @@ def _ensure_nfl_data_py_available() -> None:
     if any(fn is None for fn in (import_pbp_data, import_schedules, import_weekly_data)):
         raise ImportError(
             "nfl_data_py is required for Project Beat Vegas. Install it via 'pip install nfl_data_py'."
-        )
+        ) from _NFL_IMPORT_ERROR
+
+
+def _ensure_rosters_available() -> None:
+    if import_rosters is None:
+        raise ImportError(
+            "Roster data requires nfl_data_py>=0.3.2. Update the dependency to enable player props."
+        ) from _NFL_IMPORT_ERROR
 
 
 LOGGER = logging.getLogger(__name__)
@@ -102,6 +123,40 @@ def load_play_by_play(
     combined = pd.concat(frames, ignore_index=True)
     combined["game_id"] = combined["game_id"].astype(str)
     return combined
+
+
+def load_rosters(seasons: Iterable[int]) -> pd.DataFrame:
+    """Fetch roster data for the requested seasons, normalized for downstream joins."""
+
+    _ensure_rosters_available()
+    seasons_list = _validate_seasons(seasons)
+    LOGGER.info("Loading rosters for seasons: %s", seasons_list)
+    roster_df = import_rosters(seasons_list)
+    if roster_df.empty:
+        raise ValueError("Roster endpoint returned no rows for the requested seasons.")
+
+    if "player_id" not in roster_df.columns and "gsis_id" in roster_df.columns:
+        roster_df["player_id"] = roster_df["gsis_id"]
+
+    if "player_id" not in roster_df.columns:
+        raise ValueError("Roster dataframe missing 'player_id' column required for player props.")
+
+    team_col = None
+    for candidate in ("team", "recent_team", "team_abbr"):
+        if candidate in roster_df.columns:
+            team_col = candidate
+            break
+
+    if team_col is None:
+        raise ValueError("Roster dataframe missing any recognized team column ('team', 'recent_team').")
+
+    roster_df[team_col] = roster_df[team_col].astype(str).str.upper()
+    roster_df["player_id"] = roster_df["player_id"].astype(str)
+
+    if "season" not in roster_df.columns:
+        roster_df["season"] = seasons_list[0] if len(seasons_list) == 1 else pd.NA
+
+    return roster_df
 
 
 def convert_moneyline_to_probability(moneyline: pd.Series) -> pd.Series:

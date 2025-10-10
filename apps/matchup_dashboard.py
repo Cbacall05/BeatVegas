@@ -33,7 +33,6 @@ st.set_page_config(
         "About": "Project Beat Vegas — predictive analytics for NFL matchups.",
     },
 )
-
 CUSTOM_CSS = """
 <style>
 main .block-container {
@@ -155,6 +154,11 @@ def load_pbp_cached(seasons: tuple[int, ...]) -> pd.DataFrame:
     return data_load.load_play_by_play(list(seasons), cache_dir=cache_dir)
 
 
+@st.cache_data(show_spinner=False)
+def load_rosters_cached(seasons: tuple[int, ...]) -> pd.DataFrame:
+    return data_load.load_rosters(list(seasons))
+
+
 @st.cache_resource(show_spinner=False)
 def train_models(
     train_seasons: tuple[int, ...],
@@ -218,22 +222,48 @@ def build_player_prop_predictions(
     validation_season: int,
     week: int,
     lookback: int = 4,
-) -> tuple[pd.DataFrame, dict[str, float] | None, str | None]:
-    seasons_for_pbp = tuple(sorted(set(train_seasons + (validation_season,))))
+) -> tuple[pd.DataFrame, dict[str, float] | None, list[str]]:
+    seasons_for_data = tuple(sorted(set(train_seasons + (validation_season,))))
+    issues: list[str] = []
+
     try:
-        pbp_df = load_pbp_cached(seasons_for_pbp)
+        pbp_df = load_pbp_cached(seasons_for_data)
+    except Exception as exc:  # noqa: BLE001 - surface to UI
+        message = str(exc)
+        if "name 'Error' is not defined" in message and train_seasons:
+            fallback_seasons = tuple(sorted(set(train_seasons)))
+            warning = (
+                f"Play-by-play not yet available for season {validation_season}. "
+                "Using historical seasons only for touchdown model features."
+            )
+            issues.append(warning)
+            try:
+                pbp_df = load_pbp_cached(fallback_seasons)
+            except Exception as fallback_exc:  # noqa: BLE001 - present error to UI
+                return pd.DataFrame(), None, [warning, f"Play-by-play retry failed: {fallback_exc}"]
+        else:
+            return pd.DataFrame(), None, [f"Play-by-play unavailable: {exc}"]
+
+    roster_df: pd.DataFrame | None = None
+    try:
+        roster_df = load_rosters_cached(seasons_for_data)
+    except Exception as exc:  # noqa: BLE001 - roster filtering can be skipped
+        issues.append(f"Roster lookup skipped: {exc}")
+
+    try:
         model_result, _, upcoming = player_models.train_and_predict_touchdowns(
             schedule_df,
             pbp_df,
-            seasons=seasons_for_pbp,
+            seasons=seasons_for_data,
             target_season=validation_season,
             target_week=week,
             lookback=lookback,
             min_touches=0.75,
+            roster_df=roster_df,
         )
-        return upcoming, model_result.metrics, None
-    except Exception as exc:  # noqa: BLE001 - surface to UI
-        return pd.DataFrame(), None, str(exc)
+        return upcoming, model_result.metrics, issues
+    except Exception as exc:  # noqa: BLE001 - present error to UI
+        return pd.DataFrame(), None, issues + [str(exc)]
 
 
 def render_header():
@@ -569,12 +599,20 @@ def render_player_props(
     validation_season: int,
     week: int,
     metrics: dict[str, float] | None,
-    error: str | None,
+    issues: list[str],
 ):
     st.markdown("### Player Touchdown Probabilities")
 
-    if error is not None:
-        st.warning(f"Touchdown model unavailable: {error}")
+    warning_keywords = ("unavailable", "failed", "error", "missing", "could not", "invalid")
+    warnings = [msg for msg in issues if any(keyword in msg.lower() for keyword in warning_keywords)]
+    infos = [msg for msg in issues if msg not in warnings]
+
+    for message in infos:
+        st.info(message)
+
+    for message in warnings:
+        st.warning(message)
+    if warnings and player_props.empty:
         return
 
     if player_props.empty:
@@ -709,7 +747,7 @@ def main() -> None:
             week=week,
         )
 
-    player_props, player_metrics, player_error = build_player_prop_predictions(
+    player_props, player_metrics, player_issues = build_player_prop_predictions(
         schedule_df,
         train_seasons,
         validation_season,
@@ -730,7 +768,7 @@ def main() -> None:
             validation_season,
             week,
             player_metrics,
-            player_error,
+            player_issues,
         )
 
     st.caption(

@@ -47,14 +47,14 @@ Beat Vegas is a streamlined NFL matchup studio that learns from historical sched
 - **Matchup predictor CLI** – targets any home/away pairing, prints validation season context, and produces forward-looking win and total projections.
 - **Streamlit Matchup Studio** – interactive dashboard for selecting training seasons, tweaking rolling windows, spotlighting teams, and reviewing ensemble win probabilities in real time.
 - **Total distribution explorer** – ensemble mean/variance estimates for totals with per-model breakdowns, market edge deltas, and quick density plots for each matchup.
-- **Player touchdown lab** – per-game scorer probabilities built from recent usage, red-zone touches, and market totals, highlighting the most likely TD threats for both teams.
+- **Player touchdown lab** – per-game scorer probabilities built from recent usage, red-zone touches, market totals, and filtered against active team rosters so only current players surface.
 - **Play-by-play cache ready** – parquet library under `data/pbp` makes it easy to plug in richer PBP-derived features when needed.
 
 ## Player Props Lab
 
 - Jump into the **Player Props** tab inside the Streamlit dashboard to surface touchdown probabilities for every upcoming matchup.
 - Select a game to compare both teams’ top scorers, inspect their recent usage (touches, targets, red-zone looks), and review a probability leaderboard.
-- Probabilities come from a logistic model built on play-by-play usage trends blended with the market total, so high-volume players in rich scoring environments rise to the top.
+- Probabilities come from a logistic model built on play-by-play usage trends blended with the market total and validated against active roster data, so only current contributors in rich scoring environments rise to the top.
 
 ## Architecture
 
