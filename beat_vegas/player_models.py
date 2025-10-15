@@ -7,8 +7,8 @@ from typing import Iterable, Optional
 
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import average_precision_score, roc_auc_score
+from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.metrics import average_precision_score, roc_auc_score, mean_absolute_error, r2_score
 
 from . import data_load
 
@@ -26,6 +26,19 @@ class PlayerTouchdownModelResult:
     feature_cols: list[str]
     lookback: int
     min_touches: float
+    metrics: dict[str, float]
+    training_frame: pd.DataFrame
+
+
+@dataclass
+class PlayerPassingYardsModelResult:
+    """Container for the trained quarterback passing yards model."""
+
+    model_name: str
+    model: Ridge
+    feature_cols: list[str]
+    lookback: int
+    min_attempts: float
     metrics: dict[str, float]
     training_frame: pd.DataFrame
 
@@ -187,6 +200,191 @@ def build_player_game_stats(pbp_df: pd.DataFrame, schedule_df: pd.DataFrame) -> 
     return player_stats
 
 
+def build_quarterback_game_stats(pbp_df: pd.DataFrame, schedule_df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate play-by-play into per-quarterback passing summaries."""
+
+    if pbp_df.empty:
+        raise ValueError("Play-by-play dataframe is empty. Cannot derive quarterback stats.")
+
+    pass_mask = pbp_df.get("pass_attempt", pd.Series(dtype=float)) == 1
+    qb_cols = {
+        "game_id": pbp_df.get("game_id"),
+        "season": pbp_df.get("season"),
+        "week": pbp_df.get("week"),
+        "team": pbp_df.get("posteam"),
+        "player_id": pbp_df.get("passer_player_id"),
+        "player_display_name": pbp_df.get("passer_player_name"),
+        "position": "QB",
+        "pass_attempts": pbp_df.get("pass_attempt", pd.Series(dtype=float)),
+        "completions": pbp_df.get("complete_pass", pd.Series(dtype=float)),
+        "passing_yards": pbp_df.get("passing_yards", pd.Series(dtype=float)),
+        "interceptions": pbp_df.get("interception", pd.Series(dtype=float)),
+        "passing_touchdowns": pbp_df.get("pass_touchdown", pd.Series(dtype=float)),
+    }
+    qb_df = pd.DataFrame(qb_cols).loc[pass_mask]
+    qb_df = qb_df[qb_df["player_id"].notna()].copy()
+    if qb_df.empty:
+        raise ValueError("No quarterback passing stats available in play-by-play dataframe.")
+
+    for col in ["pass_attempts", "completions", "passing_yards", "interceptions", "passing_touchdowns"]:
+        qb_df[col] = qb_df[col].fillna(0.0)
+
+    aggregations = {
+        "player_display_name": "last",
+        "position": "last",
+        "pass_attempts": _safe_sum,
+        "completions": _safe_sum,
+        "passing_yards": _safe_sum,
+        "interceptions": _safe_sum,
+        "passing_touchdowns": _safe_sum,
+    }
+    grouped = (
+        qb_df.groupby(["season", "week", "game_id", "team", "player_id"], as_index=False)
+        .agg(aggregations)
+    )
+
+    grouped = grouped[grouped["team"].notna()].copy()
+    grouped["team"] = grouped["team"].astype(str).str.upper()
+    grouped = grouped[grouped["team"] != "TOT"]
+
+    team_schedule = data_load.explode_schedule(schedule_df)
+    schedule_cols = [
+        "season",
+        "week",
+        "game_id",
+        "team",
+        "opponent",
+        "market_total",
+        "spread_line",
+        "home_away",
+    ]
+    team_schedule = team_schedule[schedule_cols]
+
+    qb_stats = grouped.merge(team_schedule, on=["season", "week", "game_id", "team"], how="left")
+    qb_stats["player_id"] = qb_stats["player_id"].astype(str)
+    for col in ["market_total", "spread_line"]:
+        if col in qb_stats.columns:
+            qb_stats[col] = qb_stats[col].astype(float, errors="ignore")
+    return qb_stats
+
+
+def prepare_quarterback_passing_dataset(qb_stats: pd.DataFrame, lookback: int = 4) -> pd.DataFrame:
+    """Compute rolling usage features for quarterback passing projections."""
+
+    if qb_stats.empty:
+        raise ValueError("Quarterback stats dataframe is empty.")
+
+    stats = qb_stats.sort_values(["player_id", "season", "week"]).copy()
+    rolling_cols = [
+        "passing_yards",
+        "pass_attempts",
+        "completions",
+        "interceptions",
+        "passing_touchdowns",
+        "market_total",
+        "spread_line",
+    ]
+
+    for col in rolling_cols:
+        stats[f"avg_{col}"] = (
+            stats.groupby("player_id")[col]
+            .apply(lambda s: s.shift(1).rolling(window=lookback, min_periods=1).mean())
+            .reset_index(level=0, drop=True)
+        )
+
+    stats["avg_pass_attempts"] = stats["avg_pass_attempts"].fillna(0.0)
+    stats["avg_passing_yards"] = stats["avg_passing_yards"].fillna(0.0)
+    stats["avg_completions"] = stats["avg_completions"].fillna(0.0)
+    stats["avg_market_total"] = stats["avg_market_total"].fillna(stats["market_total"].fillna(0.0))
+    stats["avg_spread_line"] = stats["avg_spread_line"].fillna(stats["spread_line"].fillna(0.0))
+    stats["avg_interceptions"] = stats["avg_interceptions"].fillna(0.0)
+    stats["avg_passing_touchdowns"] = stats["avg_passing_touchdowns"].fillna(0.0)
+
+    useful_cols = [
+        "season",
+        "week",
+        "game_id",
+        "team",
+        "opponent",
+        "player_id",
+        "player_display_name",
+        "pass_attempts",
+        "completions",
+        "passing_yards",
+        "interceptions",
+        "passing_touchdowns",
+        "market_total",
+        "spread_line",
+        "avg_pass_attempts",
+        "avg_completions",
+        "avg_passing_yards",
+        "avg_interceptions",
+        "avg_passing_touchdowns",
+        "avg_market_total",
+        "avg_spread_line",
+    ]
+    for col in useful_cols:
+        if col not in stats.columns:
+            stats[col] = np.nan
+
+    return stats[useful_cols]
+
+
+def train_passing_yards_model(
+    qb_dataset: pd.DataFrame,
+    lookback: int = 4,
+    min_attempts: float = 15.0,
+    model_name: str = "Ridge",
+) -> PlayerPassingYardsModelResult:
+    """Train a regression model to project quarterback passing yards."""
+
+    df = qb_dataset.dropna(subset=["avg_passing_yards", "avg_pass_attempts", "avg_market_total"]).copy()
+    df = df[df["avg_pass_attempts"].fillna(0.0) >= min_attempts]
+    if df.empty:
+        raise ValueError("No quarterback rows meet the minimum attempts threshold for training.")
+
+    numeric_cols = [
+        "avg_passing_yards",
+        "avg_pass_attempts",
+        "avg_completions",
+        "avg_passing_touchdowns",
+        "avg_interceptions",
+        "avg_market_total",
+        "avg_spread_line",
+        "market_total",
+        "spread_line",
+    ]
+    for col in numeric_cols:
+        if col not in df.columns:
+            df[col] = 0.0
+    df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+
+    feature_cols = numeric_cols
+    X = df[feature_cols]
+    y = df["passing_yards"].astype(float).fillna(0.0)
+
+    model = Ridge(alpha=1.0, random_state=42)
+    model.fit(X, y)
+
+    preds = model.predict(X)
+    metrics = {
+        "mae": float(mean_absolute_error(y, preds)),
+        "r2": float(r2_score(y, preds)),
+    }
+    df = df.copy()
+    df["predicted_yards"] = preds
+
+    return PlayerPassingYardsModelResult(
+        model_name=model_name,
+        model=model,
+        feature_cols=feature_cols,
+        lookback=lookback,
+        min_attempts=min_attempts,
+        metrics=metrics,
+        training_frame=df,
+    )
+
+
 def prepare_player_touchdown_dataset(player_stats: pd.DataFrame, lookback: int = 4) -> pd.DataFrame:
     """Compute rolling features that capture recent usage before each game."""
 
@@ -341,6 +539,62 @@ def _aggregate_recent_usage(
     return grouped
 
 
+def _aggregate_recent_passing_usage(
+    qb_stats: pd.DataFrame,
+    target_season: int,
+    target_week: int,
+    lookback: int,
+    min_attempts: float,
+) -> pd.DataFrame:
+    history_mask = (qb_stats["season"] < target_season) | (
+        (qb_stats["season"] == target_season) & (qb_stats["week"] < target_week)
+    )
+    history = qb_stats.loc[history_mask].copy()
+    if history.empty:
+        return pd.DataFrame()
+
+    history = history.sort_values(["player_id", "season", "week"])
+    history = history[history["team"].fillna("").str.upper() != "TOT"]
+    recent = history.groupby("player_id", group_keys=False).tail(lookback)
+    grouped = recent.groupby("player_id").agg(
+        {
+            "player_display_name": "last",
+            "team": "last",
+            "opponent": "last",
+            "pass_attempts": "mean",
+            "completions": "mean",
+            "passing_yards": "mean",
+            "interceptions": "mean",
+            "passing_touchdowns": "mean",
+            "market_total": "mean",
+            "spread_line": "mean",
+        }
+    )
+
+    grouped.rename(
+        columns={
+            "player_display_name": "player_display_name",
+            "pass_attempts": "avg_pass_attempts",
+            "completions": "avg_completions",
+            "passing_yards": "avg_passing_yards",
+            "interceptions": "avg_interceptions",
+            "passing_touchdowns": "avg_passing_touchdowns",
+            "market_total": "avg_market_total",
+            "spread_line": "avg_spread_line",
+        },
+        inplace=True,
+    )
+
+    grouped = grouped[grouped["avg_pass_attempts"].fillna(0.0) >= min_attempts]
+    grouped = grouped.reset_index()
+    grouped["player_id"] = grouped["player_id"].astype(str)
+    grouped["team"] = grouped["team"].astype(str).str.upper()
+    grouped["avg_passing_yards"] = grouped["avg_passing_yards"].fillna(0.0)
+    grouped["avg_market_total"] = grouped["avg_market_total"].fillna(0.0)
+    grouped["avg_spread_line"] = grouped["avg_spread_line"].fillna(0.0)
+    return grouped
+
+
 def predict_upcoming_touchdowns(
     model_result: PlayerTouchdownModelResult,
     player_stats: pd.DataFrame,
@@ -379,6 +633,13 @@ def predict_upcoming_touchdowns(
     if usage.empty:
         LOGGER.warning("No sufficient player usage history to project upcoming touchdowns.")
         return pd.DataFrame()
+
+    if roster_lookup is not None and not roster_lookup.empty:
+        roster_map = roster_lookup[["player_id", "team"]].drop_duplicates()
+        roster_map["team"] = roster_map["team"].astype(str).str.upper()
+        usage = usage.merge(roster_map, on="player_id", how="left", suffixes=("", "_roster"))
+        usage["team"] = usage["team_roster"].where(usage["team_roster"].notna(), usage["team"])
+        usage.drop(columns=[col for col in usage.columns if col.endswith("_roster")], inplace=True)
 
     merged = usage.merge(upcoming, on="team", how="inner", suffixes=("", "_upcoming"))
     if merged.empty:
@@ -438,6 +699,110 @@ def predict_upcoming_touchdowns(
     return result.reset_index(drop=True)
 
 
+def predict_upcoming_passing_yards(
+    model_result: PlayerPassingYardsModelResult,
+    qb_stats: pd.DataFrame,
+    schedule_df: pd.DataFrame,
+    *,
+    target_season: int,
+    target_week: int,
+    roster_lookup: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    if qb_stats.empty:
+        return pd.DataFrame()
+
+    upcoming_schedule = data_load.explode_schedule(schedule_df)
+    upcoming = upcoming_schedule[
+        (upcoming_schedule["season"] == target_season)
+        & (upcoming_schedule["week"] == target_week)
+    ][["game_id", "team", "opponent", "market_total", "spread_line", "home_away"]]
+    if upcoming.empty:
+        LOGGER.warning(
+            "No upcoming schedule entries for season %s week %s.",
+            target_season,
+            target_week,
+        )
+        return pd.DataFrame()
+
+    usage = _aggregate_recent_passing_usage(
+        qb_stats,
+        target_season=target_season,
+        target_week=target_week,
+        lookback=model_result.lookback,
+        min_attempts=model_result.min_attempts,
+    )
+    if usage.empty:
+        LOGGER.warning("No quarterback usage history to project upcoming passing yards.")
+        return pd.DataFrame()
+
+    if roster_lookup is not None and not roster_lookup.empty:
+        roster_map = roster_lookup[["player_id", "team"]].drop_duplicates()
+        roster_map["team"] = roster_map["team"].astype(str).str.upper()
+        usage = usage.merge(roster_map, on="player_id", how="left", suffixes=("", "_roster"))
+        usage["team"] = usage["team_roster"].where(usage["team_roster"].notna(), usage["team"])
+        usage.drop(columns=[col for col in usage.columns if col.endswith("_roster")], inplace=True)
+
+    usage["team"] = usage["team"].astype(str).str.upper()
+    upcoming["team"] = upcoming["team"].astype(str).str.upper()
+    merged = usage.merge(upcoming, on="team", how="inner", suffixes=("", "_upcoming"))
+    if merged.empty:
+        return pd.DataFrame()
+
+    merged["player_id"] = merged["player_id"].astype(str)
+    if roster_lookup is not None and not roster_lookup.empty:
+        roster_lookup = roster_lookup.copy()
+        roster_lookup["team"] = roster_lookup["team"].astype(str).str.upper()
+        roster_lookup = roster_lookup.drop_duplicates(subset=["player_id", "team"])
+        merged = merged.merge(roster_lookup, on=["player_id", "team"], how="inner")
+        if merged.empty:
+            LOGGER.warning("No roster overlap found when filtering passing projections.")
+            return pd.DataFrame()
+
+    merged["market_total"] = merged.get("market_total_upcoming", merged.get("market_total")).fillna(merged["avg_market_total"].fillna(0.0))
+    merged["spread_line"] = merged.get("spread_line_upcoming", merged.get("spread_line")).fillna(merged["avg_spread_line"].fillna(0.0))
+    if "opponent_upcoming" in merged.columns:
+        merged["opponent"] = merged["opponent_upcoming"]
+        merged.drop(columns=["opponent_upcoming"], inplace=True)
+    if "home_away_upcoming" in merged.columns:
+        merged["home_away"] = merged["home_away_upcoming"]
+        merged.drop(columns=["home_away_upcoming"], inplace=True)
+    if "market_total_upcoming" in merged.columns:
+        merged.drop(columns=["market_total_upcoming"], inplace=True)
+    if "spread_line_upcoming" in merged.columns:
+        merged.drop(columns=["spread_line_upcoming"], inplace=True)
+
+    missing_cols = [col for col in model_result.feature_cols if col not in merged.columns]
+    for col in missing_cols:
+        merged[col] = 0.0
+
+    X_pred = merged[model_result.feature_cols].fillna(0.0)
+    merged["expected_passing_yards"] = model_result.model.predict(X_pred)
+    merged["expected_passing_yards"] = merged["expected_passing_yards"].clip(lower=0.0)
+
+    output_cols = [
+        "game_id",
+        "team",
+        "opponent",
+        "home_away",
+        "player_id",
+        "player_display_name",
+        "avg_pass_attempts",
+        "avg_completions",
+        "avg_passing_yards",
+        "avg_passing_touchdowns",
+        "avg_interceptions",
+        "avg_market_total",
+        "avg_spread_line",
+        "market_total",
+        "spread_line",
+        "expected_passing_yards",
+    ]
+    result = merged[output_cols].copy()
+    result.sort_values(["game_id", "expected_passing_yards"], ascending=[True, False], inplace=True)
+    result = result.groupby(["game_id", "team"], as_index=False, sort=False).head(1)
+    return result.reset_index(drop=True)
+
+
 def train_and_predict_touchdowns(
     schedule_df: pd.DataFrame,
     pbp_df: pd.DataFrame,
@@ -473,6 +838,49 @@ def train_and_predict_touchdowns(
     upcoming = predict_upcoming_touchdowns(
         model_result,
         player_stats,
+        schedule_df,
+        target_season=target_season,
+        target_week=target_week,
+        roster_lookup=roster_lookup,
+    )
+    return model_result, dataset, upcoming
+
+
+def train_and_predict_passing_yards(
+    schedule_df: pd.DataFrame,
+    pbp_df: pd.DataFrame,
+    *,
+    seasons: Iterable[int],
+    target_season: int,
+    target_week: int,
+    lookback: int = 4,
+    min_attempts: float = 15.0,
+    roster_df: Optional[pd.DataFrame] = None,
+) -> tuple[PlayerPassingYardsModelResult, pd.DataFrame, pd.DataFrame]:
+    """Wrapper to train and project quarterback passing yards for upcoming games."""
+
+    relevant_seasons = sorted(set(int(season) for season in seasons))
+    pbp_filtered = pbp_df[pbp_df["season"].isin(relevant_seasons)].copy()
+    if pbp_filtered.empty:
+        raise ValueError("Filtered play-by-play dataset is empty for the requested seasons.")
+
+    qb_stats = build_quarterback_game_stats(pbp_filtered, schedule_df)
+    dataset = prepare_quarterback_passing_dataset(qb_stats, lookback=lookback)
+    model_result = train_passing_yards_model(
+        dataset,
+        lookback=lookback,
+        min_attempts=min_attempts,
+    )
+
+    roster_lookup = _prepare_roster_lookup(
+        roster_df,
+        target_season=target_season,
+        target_week=target_week,
+    )
+
+    upcoming = predict_upcoming_passing_yards(
+        model_result,
+        qb_stats,
         schedule_df,
         target_season=target_season,
         target_week=target_week,

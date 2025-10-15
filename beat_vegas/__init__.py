@@ -1,6 +1,6 @@
 """Project Beat Vegas package initialization."""
 
-from . import data_load, features, models, pipeline, visuals, player_models
+from . import data_load, features, models, pipeline, visuals, player_models, injury_impact
 
 __all__ = [
     "data_load",
@@ -9,4 +9,5 @@ __all__ = [
     "pipeline",
     "visuals",
     "player_models",
+    "injury_impact",
 ]

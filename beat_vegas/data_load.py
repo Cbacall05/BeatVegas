@@ -7,6 +7,7 @@ and production-ready with simple logging hooks.
 from __future__ import annotations
 
 import logging
+from urllib.error import HTTPError
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -25,11 +26,12 @@ if _nfl_data_py is not None:  # pragma: no branch - simple attribute lookups.
     import_pbp_data = getattr(_nfl_data_py, "import_pbp_data", None)
     import_schedules = getattr(_nfl_data_py, "import_schedules", None)
     import_weekly_data = getattr(_nfl_data_py, "import_weekly_data", None)
+    import_injuries = getattr(_nfl_data_py, "import_injuries", None)
     import_rosters = getattr(_nfl_data_py, "import_rosters", None) or getattr(
         _nfl_data_py, "import_seasonal_rosters", None
     )
 else:
-    import_pbp_data = import_schedules = import_weekly_data = import_rosters = None
+    import_pbp_data = import_schedules = import_weekly_data = import_rosters = import_injuries = None
 
 
 def _ensure_nfl_data_py_available() -> None:
@@ -123,6 +125,46 @@ def load_play_by_play(
     combined = pd.concat(frames, ignore_index=True)
     combined["game_id"] = combined["game_id"].astype(str)
     return combined
+
+
+def load_injuries(seasons: Iterable[int]) -> pd.DataFrame:
+    """Fetch weekly injury reports for the requested seasons."""
+
+    if import_injuries is None:
+        raise ImportError(
+            "Injury data requires nfl_data_py. Install or upgrade the dependency to enable injury adjustments."
+        ) from _NFL_IMPORT_ERROR
+
+    seasons_list = _validate_seasons(seasons)
+    LOGGER.info("Loading injuries for seasons: %s", seasons_list)
+    try:
+        injury_df = import_injuries(seasons_list)
+    except HTTPError as exc:  # pragma: no cover - network dependent
+        LOGGER.warning("Injury endpoint returned HTTP error %s; continuing without injuries.", exc)
+        return pd.DataFrame()
+    except Exception as exc:  # noqa: BLE001 - propagate unexpected issues
+        message = str(exc)
+        if "404" in message or "Not Found" in message:
+            LOGGER.warning("Injury endpoint returned 404 for seasons %s; continuing without injuries.", seasons_list)
+            return pd.DataFrame()
+        raise
+
+    if injury_df.empty:
+        LOGGER.warning("Injury endpoint returned no rows for the requested seasons: %s", seasons_list)
+        return injury_df
+
+    injury_df = injury_df.copy()
+    if "gsis_id" in injury_df.columns and "player_id" not in injury_df.columns:
+        injury_df["player_id"] = injury_df["gsis_id"]
+
+    for col in ("team", "team_abbr", "recent_team"):
+        if col in injury_df.columns:
+            injury_df[col] = injury_df[col].astype(str).str.upper()
+
+    if "reported_date" in injury_df.columns:
+        injury_df["reported_date"] = pd.to_datetime(injury_df["reported_date"], errors="coerce")
+
+    return injury_df
 
 
 def load_rosters(seasons: Iterable[int]) -> pd.DataFrame:

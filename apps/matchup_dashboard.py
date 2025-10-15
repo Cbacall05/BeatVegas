@@ -15,7 +15,7 @@ import streamlit as st
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
-from beat_vegas import data_load, models, player_models
+from beat_vegas import data_load, models, player_models, injury_impact
 from matchup_predictor import (
     build_game_level_dataset,
     build_team_game_records,
@@ -92,6 +92,10 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 DEFAULT_TRAIN_SEASONS = list(range(2018, 2025))
 CURRENT_SEASON = max(datetime.now().year, 2025)
+LOGIT_SHIFT_SCALE = 3.5
+MANUAL_INJURY_PATH = ROOT_DIR / "configs" / "manual_injuries.csv"
+DEFAULT_SPREAD_SLOPE = 6.9
+DEFAULT_SPREAD_INTERCEPT = -0.5
 
 TEAM_ABBREVIATIONS = [
     "ARI",
@@ -143,6 +147,88 @@ def _format_prob(value: float | None) -> str:
     return f"{value:.1%}"
 
 
+def _fit_spread_mapping(
+    schedule_df: pd.DataFrame,
+    *,
+    validation_season: int,
+    week: int | None,
+) -> tuple[float, float]:
+    if schedule_df.empty:
+        raise ValueError("Schedule dataframe is empty.")
+
+    hist = schedule_df.copy()
+    cutoff_week = week if week is not None else int(hist.loc[hist["season"] == validation_season, "week"].max())
+    mask_hist = (hist["season"] < validation_season) | (
+        (hist["season"] == validation_season) & (hist["week"] < cutoff_week)
+    )
+    hist = hist.loc[mask_hist]
+    if hist.empty:
+        raise ValueError("No historical games available before the target week.")
+
+    home_prob = data_load.convert_moneyline_to_probability(hist["home_moneyline"])
+    spreads = hist["spread_line"]
+    valid = home_prob.notna() & spreads.notna()
+    if not valid.any():
+        raise ValueError("Insufficient overlap of moneyline probabilities and spreads.")
+
+    prob = home_prob.loc[valid].astype(float).clip(1e-6, 1 - 1e-6)
+    spread = spreads.loc[valid].astype(float)
+    logit = np.log(prob / (1 - prob))
+    slope, intercept = np.polyfit(logit, spread, 1)
+    return float(slope), float(intercept)
+
+
+def _probability_to_spread(probabilities: pd.Series, *, slope: float, intercept: float) -> pd.Series:
+    clipped = probabilities.astype(float).clip(1e-6, 1 - 1e-6)
+    logit = np.log(clipped / (1 - clipped))
+    return slope * logit + intercept
+
+
+def _load_manual_injury_adjustments() -> pd.DataFrame:
+    if not MANUAL_INJURY_PATH.exists():
+        return pd.DataFrame(columns=[field for field in injury_impact.InjuryAdjustment.__annotations__.keys()])
+
+    manual_df = pd.read_csv(MANUAL_INJURY_PATH)
+    if manual_df.empty:
+        return manual_df
+
+    expected = {"team", "player_name", "position", "status"}
+    missing = expected - set(manual_df.columns)
+    if missing:
+        st.warning(f"Manual injury overrides missing columns: {sorted(missing)}")
+        return pd.DataFrame(columns=[field for field in injury_impact.InjuryAdjustment.__annotations__.keys()])
+
+    manual_df = manual_df.copy()
+    manual_df["team"] = manual_df["team"].astype(str).str.upper()
+    manual_df["player_name"] = manual_df["player_name"].astype(str)
+    manual_df["position"] = manual_df["position"].astype(str).str.upper()
+    manual_df["status"] = manual_df["status"].astype(str).str.upper()
+    if "player_id" not in manual_df.columns or manual_df["player_id"].isna().all():
+        manual_df["player_id"] = manual_df.apply(
+            lambda row: f"MANUAL_{row['team']}_{row['player_name'].upper().replace(' ', '_')}"
+            , axis=1
+        )
+
+    if "impact_score" not in manual_df.columns:
+        manual_df["impact_score"] = 0.25
+    manual_df["impact_score"] = manual_df["impact_score"].astype(float).clip(lower=0.0, upper=1.0)
+
+    status_weights = {
+        key: float(value) for key, value in injury_impact.STATUS_WEIGHTS.items()
+    }
+    weight_series = manual_df["status"].map(status_weights).fillna(0.5)
+    if "penalty" in manual_df.columns:
+        manual_df["penalty"] = pd.to_numeric(manual_df["penalty"], errors="coerce")
+    else:
+        manual_df["penalty"] = np.nan
+    manual_df["penalty"] = manual_df["penalty"].where(manual_df["penalty"].notna(), manual_df["impact_score"] * weight_series)
+    manual_df["penalty"] = manual_df["penalty"].astype(float).clip(lower=0.0, upper=1.0)
+
+    return manual_df[
+        ["team", "player_id", "player_name", "position", "status", "impact_score", "penalty"]
+    ]
+
+
 @st.cache_data(show_spinner=False)
 def load_schedule_cached(seasons: tuple[int, ...]) -> pd.DataFrame:
     return data_load.load_schedule(list(seasons))
@@ -157,6 +243,106 @@ def load_pbp_cached(seasons: tuple[int, ...]) -> pd.DataFrame:
 @st.cache_data(show_spinner=False)
 def load_rosters_cached(seasons: tuple[int, ...]) -> pd.DataFrame:
     return data_load.load_rosters(list(seasons))
+
+
+@st.cache_data(show_spinner=False)
+def load_weekly_cached(seasons: tuple[int, ...]) -> pd.DataFrame:
+    return data_load.load_weekly_data(list(seasons))
+
+
+@st.cache_data(show_spinner=False)
+def load_injuries_cached(seasons: tuple[int, ...]) -> pd.DataFrame:
+    return data_load.load_injuries(list(seasons))
+
+
+def _latest_injury_records(
+    injury_df: pd.DataFrame,
+    *,
+    validation_season: int,
+    week: int,
+) -> pd.DataFrame:
+    if injury_df.empty:
+        return injury_df
+
+    filtered = injury_df.copy()
+    if "season" in filtered.columns:
+        filtered["season"] = filtered["season"].fillna(0).astype(int)
+        filtered = filtered[filtered["season"] == validation_season]
+    if "week" in filtered.columns:
+        filtered["week"] = filtered["week"].fillna(0).astype(int)
+        filtered = filtered[filtered["week"] <= week]
+
+    if filtered.empty:
+        return filtered
+
+    sort_keys: list[str] = ["player_id"]
+    if "reported_date" in filtered.columns:
+        sort_keys.append("reported_date")
+    elif "report_date" in filtered.columns:
+        sort_keys.append("report_date")
+    elif "week" in filtered.columns:
+        sort_keys.append("week")
+
+    filtered.sort_values(sort_keys, inplace=True)
+    latest = filtered.groupby("player_id", as_index=False).tail(1)
+    return latest
+
+
+def _manual_override_fallback(alerts: list[str], note: str) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    manual_adjustments = _load_manual_injury_adjustments()
+    if manual_adjustments.empty:
+        return pd.DataFrame(), pd.DataFrame(), alerts
+    penalties = injury_impact.team_penalties(manual_adjustments)
+    alerts.append(note)
+    alerts.extend(injury_impact.build_alert_messages(manual_adjustments))
+    return manual_adjustments, penalties, alerts
+
+
+def prepare_injury_context(
+    train_seasons: tuple[int, ...],
+    validation_season: int,
+    week: int,
+    *,
+    lookback_games: int = 4,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    seasons_for_data = tuple(sorted(set(train_seasons + (validation_season,))))
+    alerts: list[str] = []
+
+    try:
+        injury_df = load_injuries_cached(seasons_for_data)
+    except Exception as exc:  # noqa: BLE001 - present to UI
+        alerts.append(f"Injury data unavailable: {exc}")
+        return pd.DataFrame(), pd.DataFrame(), alerts
+
+    if injury_df.empty:
+        return _manual_override_fallback(alerts, "Using manual injury overrides while live data is unavailable.")
+
+    try:
+        weekly_df = load_weekly_cached(seasons_for_data)
+    except Exception as exc:  # noqa: BLE001 - present to UI
+        alerts.append(f"Weekly player data unavailable for injury adjustments: {exc}")
+        return pd.DataFrame(), pd.DataFrame(), alerts
+
+    usage_df = injury_impact.compute_usage_profile(weekly_df, lookback_games=lookback_games)
+    superstars = injury_impact.select_superstars(usage_df)
+    if superstars.empty:
+        return pd.DataFrame(), pd.DataFrame(), alerts
+
+    latest_injuries = _latest_injury_records(
+        injury_df,
+        validation_season=validation_season,
+        week=week,
+    )
+    if latest_injuries.empty:
+        return _manual_override_fallback(alerts, "Using manual injury overrides (no recent injury reports).")
+
+    adjustments = injury_impact.summarize_injuries(latest_injuries, superstars)
+    if adjustments.empty:
+        return _manual_override_fallback(alerts, "Using manual injury overrides (no superstar injuries detected).")
+
+    penalties = injury_impact.team_penalties(adjustments)
+    alerts.extend(injury_impact.build_alert_messages(adjustments))
+    return adjustments, penalties, alerts
 
 
 @st.cache_resource(show_spinner=False)
@@ -193,6 +379,7 @@ def build_upcoming_predictions(
     *,
     validation_season: int,
     week: int | None,
+    team_penalties: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     predictions = predict_upcoming_games(
         team_df=team_df,
@@ -211,8 +398,72 @@ def build_upcoming_predictions(
         return predictions
 
     predictions = predictions.copy()
+    try:
+        spread_slope, spread_intercept = _fit_spread_mapping(
+            schedule_df,
+            validation_season=validation_season,
+            week=week,
+        )
+    except ValueError:
+        spread_slope = DEFAULT_SPREAD_SLOPE
+        spread_intercept = DEFAULT_SPREAD_INTERCEPT
     if "game_date" in predictions.columns:
         predictions["game_date"] = pd.to_datetime(predictions["game_date"])
+
+    if team_penalties is not None and not team_penalties.empty and {"team", "penalty"}.issubset(team_penalties.columns):
+        penalty_map = team_penalties.set_index("team")["penalty"].astype(float)
+        predictions["raw_home_win_prob"] = predictions.get("avg_home_win_prob")
+        predictions["raw_away_win_prob"] = predictions.get("avg_away_win_prob")
+        predictions["injury_penalty_home"] = predictions["home_team"].map(penalty_map).fillna(0.0)
+        predictions["injury_penalty_away"] = predictions["away_team"].map(penalty_map).fillna(0.0)
+        predictions["injury_penalty_net"] = (
+            predictions["injury_penalty_away"] - predictions["injury_penalty_home"]
+        )
+
+        def _adjust_home_probability(row: pd.Series) -> float:
+            base_prob = row.get("raw_home_win_prob")
+            if base_prob is None or pd.isna(base_prob):
+                return base_prob
+            home_pen = float(row.get("injury_penalty_home", 0.0))
+            away_pen = float(row.get("injury_penalty_away", 0.0))
+            if home_pen == 0 and away_pen == 0:
+                return float(np.clip(base_prob, 0.001, 0.999))
+            logit = np.log((base_prob + 1e-6) / (1 - base_prob + 1e-6))
+            logit -= LOGIT_SHIFT_SCALE * home_pen
+            logit += LOGIT_SHIFT_SCALE * away_pen
+            adjusted = 1 / (1 + np.exp(-logit))
+            return float(np.clip(adjusted, 0.01, 0.99))
+
+        adjusted_home = predictions.apply(_adjust_home_probability, axis=1)
+        predictions["avg_home_win_prob"] = adjusted_home
+        predictions["avg_away_win_prob"] = 1 - adjusted_home
+        predictions["predicted_winner"] = np.where(
+            predictions["avg_home_win_prob"] >= predictions["avg_away_win_prob"],
+            predictions["home_team"],
+            predictions["away_team"],
+        )
+        predictions["predicted_win_prob"] = np.where(
+            predictions["predicted_winner"] == predictions["home_team"],
+            predictions["avg_home_win_prob"],
+            predictions["avg_away_win_prob"],
+        )
+
+    if "avg_home_win_prob" in predictions.columns:
+        predictions["model_spread"] = _probability_to_spread(
+            predictions["avg_home_win_prob"], slope=spread_slope, intercept=spread_intercept
+        )
+    else:
+        predictions["model_spread"] = np.nan
+
+    line_lookup = (
+        schedule_df.loc[:, ["game_id", "spread_line"]]
+        .dropna(subset=["spread_line"])
+        .drop_duplicates(subset=["game_id"], keep="last")
+        .rename(columns={"spread_line": "market_spread"})
+    )
+    predictions = predictions.merge(line_lookup, on="game_id", how="left")
+    predictions["spread_mapping_slope"] = spread_slope
+    predictions["spread_mapping_intercept"] = spread_intercept
     return predictions
 
 
@@ -222,9 +473,12 @@ def build_player_prop_predictions(
     validation_season: int,
     week: int,
     lookback: int = 4,
-) -> tuple[pd.DataFrame, dict[str, float] | None, list[str]]:
+    injury_adjustments: pd.DataFrame | None = None,
+) -> tuple[dict[str, pd.DataFrame], dict[str, dict[str, float]], list[str]]:
     seasons_for_data = tuple(sorted(set(train_seasons + (validation_season,))))
     issues: list[str] = []
+    props_by_type: dict[str, pd.DataFrame] = {}
+    metrics_by_type: dict[str, dict[str, float]] = {}
 
     try:
         pbp_df = load_pbp_cached(seasons_for_data)
@@ -240,15 +494,45 @@ def build_player_prop_predictions(
             try:
                 pbp_df = load_pbp_cached(fallback_seasons)
             except Exception as fallback_exc:  # noqa: BLE001 - present error to UI
-                return pd.DataFrame(), None, [warning, f"Play-by-play retry failed: {fallback_exc}"]
+                return props_by_type, metrics_by_type, [warning, f"Play-by-play retry failed: {fallback_exc}"]
         else:
-            return pd.DataFrame(), None, [f"Play-by-play unavailable: {exc}"]
+            return props_by_type, metrics_by_type, [f"Play-by-play unavailable: {exc}"]
 
     roster_df: pd.DataFrame | None = None
     try:
         roster_df = load_rosters_cached(seasons_for_data)
     except Exception as exc:  # noqa: BLE001 - roster filtering can be skipped
         issues.append(f"Roster lookup skipped: {exc}")
+
+    def _apply_injury_filter(df: pd.DataFrame, label: str) -> pd.DataFrame:
+        if df.empty or injury_adjustments is None or injury_adjustments.empty:
+            return df
+        inactive_players = set(injury_adjustments["player_id"].astype(str))
+        inactive_names = (
+            injury_adjustments["player_name"].astype(str).str.lower()
+            if "player_name" in injury_adjustments.columns
+            else pd.Series(dtype=str)
+        )
+        inactive_name_set = set(inactive_names)
+        if not inactive_players and not inactive_name_set:
+            return df
+        before = len(df)
+        mask_id = ~df["player_id"].astype(str).isin(inactive_players)
+        if inactive_name_set and "player_display_name" in df.columns:
+            mask_name = ~df["player_display_name"].astype(str).str.lower().isin(inactive_name_set)
+            mask_combined = mask_id & mask_name
+        else:
+            mask_combined = mask_id
+        filtered = df[mask_combined]
+        removed = before - len(filtered)
+        if removed > 0:
+            issues.append(
+                "Removed {removed} injured superstar players from {label} projections.".format(
+                    removed=removed,
+                    label=label,
+                )
+            )
+        return filtered
 
     try:
         model_result, _, upcoming = player_models.train_and_predict_touchdowns(
@@ -261,9 +545,30 @@ def build_player_prop_predictions(
             min_touches=0.75,
             roster_df=roster_df,
         )
-        return upcoming, model_result.metrics, issues
+        upcoming = _apply_injury_filter(upcoming, "touchdown")
+        props_by_type["touchdowns"] = upcoming
+        metrics_by_type["touchdowns"] = model_result.metrics
     except Exception as exc:  # noqa: BLE001 - present error to UI
-        return pd.DataFrame(), None, issues + [str(exc)]
+        issues.append(f"Touchdown model error: {exc}")
+
+    try:
+        pass_result, _, passing_upcoming = player_models.train_and_predict_passing_yards(
+            schedule_df,
+            pbp_df,
+            seasons=seasons_for_data,
+            target_season=validation_season,
+            target_week=week,
+            lookback=lookback,
+            min_attempts=12.0,
+            roster_df=roster_df,
+        )
+        passing_upcoming = _apply_injury_filter(passing_upcoming, "passing yards")
+        props_by_type["passing_yards"] = passing_upcoming
+        metrics_by_type["passing_yards"] = pass_result.metrics
+    except Exception as exc:  # noqa: BLE001 - present error to UI
+        issues.append(f"Passing yards model error: {exc}")
+
+    return props_by_type, metrics_by_type, issues
 
 
 def render_header():
@@ -284,9 +589,7 @@ def render_header():
 def render_sidebar():
     with st.sidebar:
         st.title("Matchup Controls")
-        st.caption(
-            "Tune the training window, validation season, and upcoming week to refresh predictions."
-        )
+        st.caption("Tune the training window, validation season, and upcoming week to refresh predictions.")
 
         default_train = DEFAULT_TRAIN_SEASONS
         seasons_selected = st.multiselect(
@@ -323,7 +626,60 @@ def render_sidebar():
             placeholder="Select teams to spotlight",
         )
 
-        return _season_tuple(seasons_selected), int(validation_season), int(rolling_window), int(week), _normalize_team_list(team_filter)
+        return (
+            _season_tuple(seasons_selected),
+            int(validation_season),
+            int(rolling_window),
+            int(week),
+            _normalize_team_list(team_filter),
+        )
+
+
+def render_injury_spotlight(
+    adjustments: pd.DataFrame,
+    team_penalties: pd.DataFrame,
+    alerts: list[str],
+) -> None:
+    if not alerts and (adjustments is None or adjustments.empty) and (team_penalties is None or team_penalties.empty):
+        return
+
+    st.markdown("### Injury Spotlight")
+
+    for message in alerts:
+        st.warning(message)
+
+    if adjustments is not None and not adjustments.empty:
+        st.caption("Superstar injuries impacting current projections")
+        display_cols = [
+            "team",
+            "player_name",
+            "position",
+            "status",
+            "impact_score",
+            "penalty",
+        ]
+        display_df = adjustments[display_cols].copy()
+        display_df.rename(
+            columns={
+                "team": "Team",
+                "player_name": "Player",
+                "position": "Pos",
+                "status": "Status",
+                "impact_score": "Usage Impact",
+                "penalty": "Penalty",
+            },
+            inplace=True,
+        )
+        display_df["Usage Impact"] = display_df["Usage Impact"].astype(float).map(lambda v: f"{v:.2f}")
+        display_df["Penalty"] = display_df["Penalty"].astype(float).map(lambda v: f"{v * 100:.1f}%")
+        st.dataframe(display_df, hide_index=True, use_container_width=True)
+
+    if team_penalties is not None and not team_penalties.empty:
+        st.caption("Aggregated penalty applied per team")
+        penalty_df = team_penalties.copy()
+        penalty_df.rename(columns={"team": "Team", "penalty": "Penalty"}, inplace=True)
+        penalty_df["Penalty"] = penalty_df["Penalty"].astype(float).map(lambda v: f"{v * 100:.1f}%")
+        st.dataframe(penalty_df, hide_index=True, use_container_width=True)
 
 
 def render_metrics(predictions: pd.DataFrame, team_filter: list[str]):
@@ -362,6 +718,10 @@ def render_metrics(predictions: pd.DataFrame, team_filter: list[str]):
     display_df["Home Win %"] = display_df["avg_home_win_prob"].map(_format_prob)
     display_df["Winner"] = display_df["predicted_winner"]
     display_df["Confidence"] = display_df["predicted_win_prob"].map(_format_prob)
+    if "model_spread" in display_df.columns:
+        display_df["Model Spread"] = display_df["model_spread"].map(lambda v: f"{v:+.1f}" if pd.notna(v) else "–")
+    if "market_spread" in display_df.columns:
+        display_df["Market Spread"] = display_df["market_spread"].map(lambda v: f"{v:+.1f}" if pd.notna(v) else "–")
     show_cols = [
         "Kickoff",
         "week",
@@ -370,6 +730,8 @@ def render_metrics(predictions: pd.DataFrame, team_filter: list[str]):
         "Winner",
         "Confidence",
         "Home Win %",
+        "Model Spread",
+        "Market Spread",
         "market_total",
     ]
     show_cols = [col for col in show_cols if col in display_df.columns]
@@ -422,6 +784,10 @@ def render_metrics(predictions: pd.DataFrame, team_filter: list[str]):
         "avg_away_win_prob",
         "predicted_winner",
         "predicted_win_prob",
+        "model_spread",
+        "market_spread",
+        "spread_mapping_slope",
+        "spread_mapping_intercept",
         "market_total",
         "home_moneyline",
         "away_moneyline",
@@ -432,6 +798,13 @@ def render_metrics(predictions: pd.DataFrame, team_filter: list[str]):
     for col in ["avg_home_win_prob", "avg_away_win_prob", "predicted_win_prob"]:
         if col in formatted:
             formatted[col] = formatted[col].map(_format_prob)
+    if "model_spread" in formatted:
+        formatted["model_spread"] = formatted["model_spread"].map(lambda v: f"{v:+.2f}" if pd.notna(v) else "–")
+    if "market_spread" in formatted:
+        formatted["market_spread"] = formatted["market_spread"].map(lambda v: f"{v:+.2f}" if pd.notna(v) else "–")
+    for col in ["spread_mapping_slope", "spread_mapping_intercept"]:
+        if col in formatted:
+            formatted[col] = formatted[col].map(lambda v: f"{v:.3f}" if pd.notna(v) else "–")
 
     st.dataframe(formatted, use_container_width=True)
 
@@ -593,15 +966,73 @@ def render_totals_section(predictions: pd.DataFrame):
         st.dataframe(per_model_df, hide_index=True, use_container_width=True)
 
 
+def render_spreads_section(predictions: pd.DataFrame):
+    if predictions.empty or "model_spread" not in predictions.columns:
+        st.info("Spread projections are not available for the current filters.")
+        return
+
+    st.markdown("### Spread Outlook")
+
+    slope_values = predictions.get("spread_mapping_slope")
+    intercept_values = predictions.get("spread_mapping_intercept")
+    slope = slope_values.dropna().iloc[0] if slope_values is not None and not slope_values.dropna().empty else None
+    intercept = (
+        intercept_values.dropna().iloc[0]
+        if intercept_values is not None and not intercept_values.dropna().empty
+        else None
+    )
+    if slope is not None and intercept is not None:
+        st.caption(f"Mapping: spread = {slope:.3f} × logit(p) + {intercept:.3f}")
+
+    required_cols = {"game_id", "week", "home_team", "away_team", "model_spread", "market_spread"}
+    if not required_cols.issubset(predictions.columns):
+        st.info("Insufficient columns to display spread projections.")
+        return
+
+    table = predictions[list(required_cols)].copy()
+    table["Model"] = table["model_spread"].map(lambda v: f"{v:+.1f}" if pd.notna(v) else "–")
+    table["Market"] = table["market_spread"].map(lambda v: f"{v:+.1f}" if pd.notna(v) else "–")
+    table["Edge"] = (table["model_spread"] - table["market_spread"]).map(
+        lambda v: f"{v:+.1f}" if pd.notna(v) else "–"
+    )
+
+    st.dataframe(
+        table[["week", "home_team", "away_team", "Model", "Market", "Edge"]]
+        .rename(columns={"week": "Week", "home_team": "Home", "away_team": "Away"})
+        .sort_values("Week"),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    edge_numeric = table["model_spread"] - table["market_spread"]
+    if edge_numeric.notna().any():
+        chart_df = table.assign(edge_numeric=edge_numeric)
+        spread_chart = px.bar(
+            chart_df,
+            x="edge_numeric",
+            y="game_id",
+            orientation="h",
+            labels={"edge_numeric": "Model - Market (pts)", "game_id": "Game"},
+            color="edge_numeric",
+            color_continuous_scale=["#ef4444", "#f97316", "#22c55e"],
+        )
+        spread_chart.update_layout(
+            height=420,
+            margin=dict(l=10, r=10, t=40, b=40),
+            coloraxis_showscale=False,
+        )
+        st.plotly_chart(spread_chart, use_container_width=True)
+
+
 def render_player_props(
-    player_props: pd.DataFrame,
+    props_by_type: dict[str, pd.DataFrame],
     schedule_df: pd.DataFrame,
     validation_season: int,
     week: int,
-    metrics: dict[str, float] | None,
+    metrics_by_type: dict[str, dict[str, float]],
     issues: list[str],
 ):
-    st.markdown("### Player Touchdown Probabilities")
+    st.markdown("### Player Props")
 
     warning_keywords = ("unavailable", "failed", "error", "missing", "could not", "invalid")
     warnings = [msg for msg in issues if any(keyword in msg.lower() for keyword in warning_keywords)]
@@ -612,15 +1043,68 @@ def render_player_props(
 
     for message in warnings:
         st.warning(message)
-    if warnings and player_props.empty:
+
+    label_lookup = {
+        "touchdowns": "Touchdowns",
+        "passing_yards": "Passing Yards",
+    }
+    available_types = [key for key in label_lookup if key in props_by_type]
+    if not available_types:
+        st.info("Player prop models are not available for the selected configuration.")
         return
 
-    if player_props.empty:
-        st.info(
-            "Touchdown projections will appear here once sufficient history is available for the selected matchup window."
-        )
+    upcoming_slice = schedule_df[
+        (schedule_df["season"] == validation_season)
+        & (schedule_df["week"] == week)
+    ][["game_id", "home_team", "away_team", "gameday"]].copy()
+    if upcoming_slice.empty:
+        st.info("No schedule entries available for the selected week.")
         return
 
+    upcoming_slice["label"] = upcoming_slice.apply(
+        lambda row: f"Week {week}: {row['away_team']} @ {row['home_team']}", axis=1
+    )
+    options = upcoming_slice.sort_values("label")
+    selection = st.selectbox("Choose a matchup", options["label"].tolist(), key="props_matchup_select")
+    selected_row = upcoming_slice.loc[upcoming_slice["label"] == selection].iloc[0]
+    selected_game_id = selected_row["game_id"]
+    home_team = selected_row["home_team"]
+    away_team = selected_row["away_team"]
+
+    option_to_key = {label_lookup[key]: key for key in available_types}
+    labels = list(option_to_key.keys())
+    selected_label = st.radio(
+        "Prop Type",
+        options=labels,
+        horizontal=True,
+        key="props_type_choice",
+    )
+    selected_type = option_to_key[selected_label]
+
+    selected_df = props_by_type.get(selected_type, pd.DataFrame())
+    if selected_df.empty:
+        st.info("No player projections found for the selected configuration.")
+        return
+
+    game_df = selected_df[selected_df["game_id"] == selected_game_id].copy()
+    if game_df.empty:
+        st.info("No player projections found for the selected matchup.")
+        return
+
+    selected_metrics = metrics_by_type.get(selected_type) or {}
+
+    if selected_type == "touchdowns":
+        render_touchdown_prop_details(game_df, selected_metrics, home_team, away_team)
+    elif selected_type == "passing_yards":
+        render_passing_yards_prop_details(game_df, selected_metrics, home_team, away_team)
+
+
+def render_touchdown_prop_details(
+    game_players: pd.DataFrame,
+    metrics: dict[str, float],
+    home_team: str,
+    away_team: str,
+) -> None:
     if metrics:
         cols = st.columns(3)
         auc = metrics.get("auc")
@@ -636,29 +1120,11 @@ def render_player_props(
             f"{base_rate:.2%}" if isinstance(base_rate, float) and not np.isnan(base_rate) else "–",
         )
 
-    upcoming_slice = schedule_df[
-        (schedule_df["season"] == validation_season)
-        & (schedule_df["week"] == week)
-    ][["game_id", "home_team", "away_team", "gameday"]].copy()
-    if upcoming_slice.empty:
-        st.info("No schedule entries available for the selected week.")
-        return
-
-    upcoming_slice["label"] = upcoming_slice.apply(
-        lambda row: f"Week {week}: {row['away_team']} @ {row['home_team']}", axis=1
-    )
-    options = upcoming_slice.sort_values("label")
-    selection = st.selectbox("Choose a matchup", options["label"].tolist())
-    selected_row = upcoming_slice.loc[upcoming_slice["label"] == selection].iloc[0]
-    selected_game_id = selected_row["game_id"]
-    home_team = selected_row["home_team"]
-    away_team = selected_row["away_team"]
-
-    game_players = player_props[player_props["game_id"] == selected_game_id].copy()
     if game_players.empty:
-        st.info("No player projections found for the selected matchup.")
+        st.info("No touchdown projections found for the selected matchup.")
         return
 
+    game_players = game_players.copy()
     game_players["td_prob"] = game_players["touchdown_prob"].astype(float)
     game_players["Touches"] = game_players["avg_total_touches"].map(lambda v: f"{v:.1f}")
     game_players["Rush Att"] = game_players["avg_rush_attempts"].map(lambda v: f"{v:.1f}")
@@ -677,7 +1143,7 @@ def render_player_props(
         .head(8)
     )
 
-    st.markdown("#### Top Scorers")
+    st.markdown("#### Touchdown Leaders")
     cols = st.columns(2)
     cols[0].markdown(f"**{home_team} (Home)**")
     cols[0].dataframe(
@@ -719,14 +1185,109 @@ def render_player_props(
     st.plotly_chart(fig, use_container_width=True)
 
     st.caption(
-        "Probabilities reflect the chance that a player scores at least one touchdown, driven by recent usage trends and the upcoming game's market total."
+        "Probabilities reflect the chance that a player scores at least one touchdown, based on recent usage trends and the upcoming game's context."
+    )
+
+
+def render_passing_yards_prop_details(
+    game_qbs: pd.DataFrame,
+    metrics: dict[str, float],
+    home_team: str,
+    away_team: str,
+) -> None:
+    cols = st.columns(2)
+    mae = metrics.get("mae") if metrics else None
+    r2 = metrics.get("r2") if metrics else None
+    cols[0].metric("MAE (yds)", f"{mae:.1f}" if isinstance(mae, float) and not np.isnan(mae) else "–")
+    cols[1].metric("R²", f"{r2:.3f}" if isinstance(r2, float) and not np.isnan(r2) else "–")
+
+    if game_qbs.empty:
+        st.info("No quarterback projections found for the selected matchup.")
+        return
+
+    game_qbs = game_qbs.copy()
+    game_qbs["Expected Yards"] = game_qbs["expected_passing_yards"].astype(float).map(lambda v: f"{v:.1f}")
+    game_qbs["Avg Attempts"] = game_qbs["avg_pass_attempts"].map(lambda v: f"{v:.1f}")
+    game_qbs["Avg Completions"] = game_qbs["avg_completions"].map(lambda v: f"{v:.1f}")
+    game_qbs["Avg Yds"] = game_qbs["avg_passing_yards"].map(lambda v: f"{v:.1f}")
+    game_qbs["Avg TD"] = game_qbs["avg_passing_touchdowns"].map(lambda v: f"{v:.2f}")
+    game_qbs["Avg INT"] = game_qbs["avg_interceptions"].map(lambda v: f"{v:.2f}")
+
+    home_df = (
+        game_qbs[game_qbs["team"] == home_team]
+        .sort_values("expected_passing_yards", ascending=False)
+        .head(4)
+    )
+    away_df = (
+        game_qbs[game_qbs["team"] == away_team]
+        .sort_values("expected_passing_yards", ascending=False)
+        .head(4)
+    )
+
+    st.markdown("#### Passing Yardage Outlook")
+    cols = st.columns(2)
+    cols[0].markdown(f"**{home_team} (Home)**")
+    cols[0].dataframe(
+        home_df[["player_display_name", "Expected Yards", "Avg Attempts", "Avg Completions", "Avg TD", "Avg INT"]]
+        .rename(columns={"player_display_name": "Quarterback"}),
+        hide_index=True,
+        use_container_width=True,
+    )
+    cols[1].markdown(f"**{away_team} (Away)**")
+    cols[1].dataframe(
+        away_df[["player_display_name", "Expected Yards", "Avg Attempts", "Avg Completions", "Avg TD", "Avg INT"]]
+        .rename(columns={"player_display_name": "Quarterback"}),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    st.markdown("#### Yardage Distribution")
+    chart_df = game_qbs.sort_values("expected_passing_yards", ascending=True)
+    palette = {home_team: "#1d428a", away_team: "#c8102e"}
+    colors = [palette.get(team, "#555555") for team in chart_df["team"]]
+    fig = go.Figure(
+        go.Bar(
+            x=chart_df["expected_passing_yards"],
+            y=chart_df["player_display_name"],
+            orientation="h",
+            text=chart_df["expected_passing_yards"].map(lambda v: f"{v:.1f}"),
+            marker_color=colors,
+            customdata=np.column_stack([chart_df["team"], chart_df["avg_pass_attempts"]]),
+            hovertemplate="%{y} (%{customdata[0]}) — Attempts %{customdata[1]:.1f} | %{x:.1f} yds<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        yaxis=dict(autorange="reversed"),
+        xaxis=dict(title="Expected Passing Yards"),
+        height=420,
+        margin=dict(l=90, r=20, t=30, b=40),
+        showlegend=False,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.caption(
+        "Projections combine recent quarterback usage with market context to estimate expected passing yards."
     )
 
 def main() -> None:
     render_header()
     train_seasons, validation_season, rolling_window, week, team_filter = render_sidebar()
+    injury_adjustments = pd.DataFrame()
+    team_penalties = pd.DataFrame()
+    injury_alerts: list[str] = []
+    predictions = pd.DataFrame()
+    player_props: dict[str, pd.DataFrame] = {}
+    player_metrics: dict[str, dict[str, float]] = {}
+    player_issues: list[str] = []
 
     with st.spinner("Training models and generating predictions..."):
+        injury_adjustments, team_penalties, injury_alerts = prepare_injury_context(
+            train_seasons,
+            validation_season,
+            week,
+            lookback_games=rolling_window,
+        )
+
         (
             schedule_df,
             team_df,
@@ -745,20 +1306,26 @@ def main() -> None:
             totals_results,
             validation_season=validation_season,
             week=week,
+            team_penalties=team_penalties,
         )
 
-    player_props, player_metrics, player_issues = build_player_prop_predictions(
-        schedule_df,
-        train_seasons,
-        validation_season,
-        week,
-        lookback=4,
-    )
+        player_props, player_metrics, player_issues = build_player_prop_predictions(
+            schedule_df,
+            train_seasons,
+            validation_season,
+            week,
+            lookback=4,
+            injury_adjustments=injury_adjustments,
+        )
 
-    matchups_tab, totals_tab, props_tab = st.tabs(["Matchups", "Totals", "Player Props"])
+    render_injury_spotlight(injury_adjustments, team_penalties, injury_alerts)
+
+    matchups_tab, spreads_tab, totals_tab, props_tab = st.tabs(["Matchups", "Spreads", "Totals", "Player Props"])
 
     with matchups_tab:
         render_metrics(predictions, team_filter)
+    with spreads_tab:
+        render_spreads_section(predictions)
     with totals_tab:
         render_totals_section(predictions)
     with props_tab:
