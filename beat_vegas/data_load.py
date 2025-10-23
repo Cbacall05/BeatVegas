@@ -13,6 +13,10 @@ from typing import Iterable, Optional
 
 import pandas as pd
 
+from . import schedule_enrichment
+
+REST_TRAVEL_CACHE = Path("data") / "external" / "features" / "rest_travel.parquet"
+
 _NFL_IMPORT_ERROR: Optional[ImportError]
 
 try:  # Lazy import to keep module importable without dependency installed.
@@ -68,13 +72,23 @@ def _validate_seasons(seasons: Iterable[int]) -> list[int]:
     return unique_seasons
 
 
-def load_schedule(seasons: Iterable[int]) -> pd.DataFrame:
+def load_schedule(
+    seasons: Iterable[int],
+    *,
+    persist_rest_travel: bool = True,
+    rest_cache_path: Path | None = REST_TRAVEL_CACHE,
+) -> pd.DataFrame:
     """Fetch game schedules for the requested seasons."""
     _ensure_nfl_data_py_available()
     seasons_list = _validate_seasons(seasons)
     LOGGER.info("Loading schedules for seasons: %s", seasons_list)
     schedule_df = import_schedules(seasons_list)
     schedule_df["game_id"] = schedule_df["game_id"].astype(str)
+    try:
+        persist_path = rest_cache_path if persist_rest_travel and rest_cache_path is not None else None
+        schedule_df = schedule_enrichment.attach_rest_travel(schedule_df, persist_path=persist_path)
+    except Exception as exc:  # noqa: BLE001 - enrichment is best effort
+        LOGGER.warning("Rest/travel enrichment skipped: %s", exc)
     return schedule_df
 
 

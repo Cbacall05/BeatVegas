@@ -513,8 +513,12 @@ def build_upcoming_predictions(
 
     if team_penalties is not None and not team_penalties.empty and {"team", "penalty"}.issubset(team_penalties.columns):
         penalty_map = team_penalties.set_index("team")["penalty"].astype(float)
-        predictions["raw_home_win_prob"] = predictions.get("avg_home_win_prob")
-        predictions["raw_away_win_prob"] = predictions.get("avg_away_win_prob")
+        if "avg_home_win_prob_raw" in predictions.columns:
+            predictions["raw_home_win_prob"] = predictions["avg_home_win_prob_raw"]
+            predictions["raw_away_win_prob"] = 1 - predictions["avg_home_win_prob_raw"]
+        else:
+            predictions["raw_home_win_prob"] = predictions.get("avg_home_win_prob")
+            predictions["raw_away_win_prob"] = predictions.get("avg_away_win_prob")
         predictions["injury_penalty_home"] = predictions["home_team"].map(penalty_map).fillna(0.0)
         predictions["injury_penalty_away"] = predictions["away_team"].map(penalty_map).fillna(0.0)
         predictions["injury_penalty_net"] = (
@@ -1503,7 +1507,7 @@ def main() -> None:
         st.cache_data.clear()
         st.cache_resource.clear()
         st.session_state["_cache_initialized"] = True
-        st.experimental_rerun()
+        st.rerun()
 
     debug_team = st.sidebar.text_input("Debug Team (e.g., NYJ)", value="NYJ")
     injury_adjustments = pd.DataFrame()

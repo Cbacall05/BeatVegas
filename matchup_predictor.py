@@ -89,6 +89,11 @@ def build_team_game_records(schedule_df: pd.DataFrame, rolling_window: int = 4) 
         home_prob = moneyline_to_prob(getattr(row, "home_moneyline", np.nan))
         away_prob = moneyline_to_prob(getattr(row, "away_moneyline", np.nan))
 
+        home_rest = getattr(row, "home_rest_days", getattr(row, "home_rest", np.nan))
+        away_rest = getattr(row, "away_rest_days", getattr(row, "away_rest", np.nan))
+        home_travel = getattr(row, "home_travel_miles", np.nan)
+        away_travel = getattr(row, "away_travel_miles", np.nan)
+
         home_record = {
             "game_id": row.game_id,
             "season": row.season,
@@ -103,7 +108,8 @@ def build_team_game_records(schedule_df: pd.DataFrame, rolling_window: int = 4) 
             "market_total": total_line,
             "market_spread": spread_line,
             "market_prob": home_prob,
-            "rest": getattr(row, "home_rest", np.nan),
+            "rest": home_rest,
+            "travel_miles": home_travel,
             "win": int(home_points > away_points),
         }
         away_record = {
@@ -120,7 +126,8 @@ def build_team_game_records(schedule_df: pd.DataFrame, rolling_window: int = 4) 
             "market_total": total_line,
             "market_spread": -spread_line if pd.notna(spread_line) else np.nan,
             "market_prob": away_prob,
-            "rest": getattr(row, "away_rest", np.nan),
+            "rest": away_rest,
+            "travel_miles": away_travel,
             "win": int(away_points > home_points),
         }
         records.extend([home_record, away_record])
@@ -137,6 +144,7 @@ def build_team_game_records(schedule_df: pd.DataFrame, rolling_window: int = 4) 
         "market_spread",
         "market_prob",
         "rest",
+        "travel_miles",
     ]
     for metric in rolling_metrics:
         team_df[f"{metric}_avg"] = team_group[metric].transform(
@@ -160,6 +168,7 @@ DIFF_BASES = [
     "market_prob_avg",
     "win_rate_avg",
     "rest_avg",
+    "travel_miles_avg",
 ]
 
 
@@ -205,6 +214,31 @@ def select_feature_columns(dataset: pd.DataFrame) -> list[str]:
         if col.startswith("diff_"):
             feature_cols.append(col)
     return sorted(set(feature_cols))
+
+
+def _apply_calibration(result: models.ModelResult, raw_prob: float) -> float:
+    calibrator = result.calibrator
+    if calibrator is None:
+        return float(np.clip(raw_prob, 1e-6, 1 - 1e-6))
+
+    try:
+        if result.calibration_method == "isotonic" and hasattr(calibrator, "predict"):
+            arr = np.asarray([raw_prob])
+            return float(np.clip(calibrator.predict(arr)[0], 1e-6, 1 - 1e-6))
+        if hasattr(calibrator, "predict_proba"):
+            arr = np.asarray([[raw_prob]])
+            return float(np.clip(calibrator.predict_proba(arr)[0][1], 1e-6, 1 - 1e-6))
+        if hasattr(calibrator, "predict"):
+            arr = np.asarray([[raw_prob]]) if np.ndim(raw_prob) == 0 else raw_prob
+            pred = calibrator.predict(arr)
+            if np.ndim(pred) == 1:
+                value = pred[0]
+            else:
+                value = pred
+            return float(np.clip(value, 1e-6, 1 - 1e-6))
+    except Exception as exc:  # noqa: BLE001 - calibration is best effort
+        LOGGER.warning("Calibration fallback triggered for %s: %s", result.model_name, exc)
+    return float(np.clip(raw_prob, 1e-6, 1 - 1e-6))
 
 
 def predict_upcoming_games(
@@ -267,19 +301,27 @@ def predict_upcoming_games(
             "market_total": getattr(row, "total_line", None),
             "home_moneyline": getattr(row, "home_moneyline", None),
             "away_moneyline": getattr(row, "away_moneyline", None),
+            "home_rest_days": getattr(row, "home_rest_days", np.nan),
+            "away_rest_days": getattr(row, "away_rest_days", np.nan),
+            "home_travel_miles": getattr(row, "home_travel_miles", np.nan),
+            "away_travel_miles": getattr(row, "away_travel_miles", np.nan),
         }
 
-        home_probs: list[float] = []
+        home_probs_raw: list[float] = []
+        home_probs_calibrated: list[float] = []
 
         for result in moneyline_results:
             model = result.model
             try:
-                proba = float(model.predict_proba(feature_frame)[0][1])
+                raw_prob = float(model.predict_proba(feature_frame)[0][1])
             except AttributeError:
-                proba = float(model.predict(feature_frame))
-            base[f"{result.model_name}_home_win"] = proba
-            base[f"{result.model_name}_away_win"] = 1 - proba
-            home_probs.append(proba)
+                raw_prob = float(model.predict(feature_frame))
+            calibrated_prob = _apply_calibration(result, raw_prob)
+            base[f"{result.model_name}_home_win_raw"] = raw_prob
+            base[f"{result.model_name}_home_win"] = calibrated_prob
+            base[f"{result.model_name}_away_win"] = 1 - calibrated_prob
+            home_probs_raw.append(raw_prob)
+            home_probs_calibrated.append(calibrated_prob)
 
         total_preds: list[float] = []
         total_stds: list[float] = []
@@ -310,8 +352,12 @@ def predict_upcoming_games(
             base["ensemble_total_p25"] = float(avg_total - quartile_offset)
             base["ensemble_total_p75"] = float(avg_total + quartile_offset)
 
-        if home_probs:
-            avg_home = float(np.mean(home_probs))
+        if home_probs_raw:
+            avg_home_raw = float(np.mean(home_probs_raw))
+            base["avg_home_win_prob_raw"] = avg_home_raw
+            base["avg_away_win_prob_raw"] = float(1 - avg_home_raw)
+        if home_probs_calibrated:
+            avg_home = float(np.mean(home_probs_calibrated))
             avg_away = float(1 - avg_home)
             base["avg_home_win_prob"] = avg_home
             base["avg_away_win_prob"] = avg_away

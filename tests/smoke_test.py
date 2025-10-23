@@ -55,6 +55,7 @@ def run_models_smoke_test() -> None:
     totals_market = pd.DataFrame({"game_id": df[df["season"] == 2023]["game_id"].unique(), "market_total": 45})
 
     for result in moneyline_results:
+        assert "calibrated_win_proba" in result.predictions.columns
         models.detect_moneyline_mispricing(result.predictions, market_prices)
     for result in totals_results:
         models.detect_total_mispricing(result.predictions, totals_market)

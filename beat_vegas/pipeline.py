@@ -45,6 +45,24 @@ def build_model_ready_frame(
             },
             inplace=True,
         )
+
+    rest_travel_cols = [
+        "home_rest_days",
+        "away_rest_days",
+        "rest_days_diff",
+        "home_travel_miles",
+        "away_travel_miles",
+        "travel_miles_diff",
+        "home_short_week",
+        "away_short_week",
+        "home_long_rest",
+        "away_long_rest",
+        "rest_advantage_bucket",
+    ]
+    available_rest_cols = [col for col in rest_travel_cols if col in schedule_df.columns]
+    if available_rest_cols:
+        rest_frame = schedule_df[["game_id"] + available_rest_cols].drop_duplicates("game_id")
+        game_level = game_level.merge(rest_frame, on="game_id", how="left")
     return game_level
 
 
@@ -68,6 +86,7 @@ def default_feature_columns(dataset: pd.DataFrame) -> list[str]:
     """Return a heuristic set of model features suitable for baselines."""
 
     cols = []
+    allowed_suffixes = ("_avg", "_games_played", "_rest_days", "_travel_miles")
     for col in dataset.columns:
         if not (col.startswith("home_") or col.startswith("away_")):
             continue
@@ -75,8 +94,13 @@ def default_feature_columns(dataset: pd.DataFrame) -> list[str]:
             continue
         if col.endswith("_market_prob"):
             continue
+        if not col.endswith(allowed_suffixes):
+            continue
         cols.append(col)
-    return sorted(cols)
+    for extra in ("rest_days_diff", "travel_miles_diff"):
+        if extra in dataset.columns:
+            cols.append(extra)
+    return sorted(set(cols))
 
 
 def detect_edges(
@@ -90,8 +114,13 @@ def detect_edges(
 
     schedule_long = data_load.explode_schedule(schedule_df)
     home_market = schedule_long[schedule_long["home_away"] == "home"][
-        ["game_id", "market_implied_prob"]
-    ].rename(columns={"market_implied_prob": "market_prob"})
+        ["game_id", "season", "week", "team", "market_implied_prob"]
+    ].rename(
+        columns={
+            "team": "home_team",
+            "market_implied_prob": "market_prob",
+        }
+    )
 
     totals_market = schedule_df[["game_id", "total_line"]].rename(columns={"total_line": "market_total"})
 
@@ -109,3 +138,32 @@ def detect_edges(
             threshold=edge_threshold_totals,
         )
     return edges
+
+
+def compute_bias_reports(
+    moneyline_results: list[models.ModelResult],
+    schedule_df: pd.DataFrame,
+    *,
+    use_calibrated: bool = True,
+    min_games: int = 12,
+    bucket_size: float = 0.1,
+) -> dict[str, dict[str, pd.DataFrame]]:
+    """Generate calibration bias summaries for trained classifiers."""
+
+    home_market = schedule_df[["game_id", "season", "week", "home_team", "home_moneyline"]].copy()
+    if "home_moneyline" in home_market.columns:
+        home_market["market_prob"] = data_load.convert_moneyline_to_probability(home_market["home_moneyline"])
+    elif "home_market_prob" in schedule_df.columns:
+        home_market["market_prob"] = schedule_df["home_market_prob"]
+    home_market = home_market.drop(columns=["home_moneyline"], errors="ignore")
+
+    reports: dict[str, dict[str, pd.DataFrame]] = {}
+    for result in moneyline_results:
+        reports[result.model_name] = models.compute_calibration_bias(
+            result,
+            home_market,
+            use_calibrated=use_calibrated,
+            min_games=min_games,
+            bucket_size=bucket_size,
+        )
+    return reports
