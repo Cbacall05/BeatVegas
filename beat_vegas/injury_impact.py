@@ -7,18 +7,27 @@ from typing import Iterable, Optional
 import numpy as np
 import pandas as pd
 
-SUPERSTAR_POSITIONS = {"QB", "WR", "TE", "RB"}
+SUPERSTAR_POSITIONS = {"QB", "WR", "TE", "RB", "EDGE"}
 IMPORTANCE_LOOKBACK_GAMES = 4
-STATUS_WEIGHTS = {
+DEFAULT_STATUS_WEIGHTS = {
     "OUT": 1.0,
-    "DOUBTFUL": 0.85,
-    "QUESTIONABLE": 0.6,
-    "DID NOT PARTICIPATE": 0.75,
-    "LIMITED": 0.3,
+    "DOUBTFUL": 0.8,
+    "QUESTIONABLE": 0.5,
+    "DID NOT PARTICIPATE": 0.7,
+    "LIMITED": 0.25,
     "SUSPENDED": 1.0,
     "INJURED RESERVE": 1.0,
     "PUP": 1.0,
 }
+POSITION_IMPORTANCE_WEIGHTS = {
+    "QB": 1.0,
+    "WR": 0.28,
+    "RB": 0.24,
+    "TE": 0.12,
+    "EDGE": 0.08,
+}
+DEFAULT_POSITION_WEIGHT = 0.1
+TEAM_PENALTY_CAP = 0.2
 
 
 @dataclass(frozen=True)
@@ -44,6 +53,23 @@ def _standardize_status(series: pd.Series) -> pd.Series:
         "PHYSICALLY UNABLE TO PERFORM": "PUP",
         "DID NOT PARTICIPATE IN PRACTICE": "DID NOT PARTICIPATE",
     })
+
+
+def apply_position_weight(adjustments: pd.DataFrame) -> pd.DataFrame:
+    """Scale penalties by positional importance while retaining raw impact for display."""
+
+    if adjustments is None or adjustments.empty:
+        return adjustments
+
+    if "position" not in adjustments.columns or "penalty" not in adjustments.columns:
+        return adjustments
+
+    weighted = adjustments.copy()
+    position_codes = weighted["position"].astype(str).str.upper()
+    weights = position_codes.map(POSITION_IMPORTANCE_WEIGHTS).fillna(DEFAULT_POSITION_WEIGHT)
+    weighted["position_weight"] = weights.astype(float)
+    weighted["penalty"] = (weighted["penalty"].astype(float) * weights.astype(float)).clip(lower=0.0, upper=1.0)
+    return weighted
 
 
 def compute_usage_profile(
@@ -118,7 +144,7 @@ def compute_usage_profile(
     if aggregates.empty:
         return pd.DataFrame(columns=["player_id", "team", "position", "player_name", "impact_score"])
 
-    qb_boost = np.where(aggregates["position"] == "QB", 0.15, 0.0)
+    qb_boost = np.where(aggregates["position"] == "QB", 0.1, 0.0)
     usage_component = aggregates["avg_usage_share"].fillna(0)
     epa_component = aggregates["avg_epa_share"].fillna(0)
     impact = np.clip(0.7 * usage_component + 0.3 * epa_component + qb_boost, 0, 1)
@@ -143,6 +169,7 @@ def summarize_injuries(
     superstar_df: pd.DataFrame,
     *,
     include_statuses: Optional[Iterable[str]] = None,
+    status_weights: Optional[dict[str, float]] = None,
 ) -> pd.DataFrame:
     """Join injury reports with superstar impact scores and compute penalties."""
 
@@ -153,11 +180,13 @@ def summarize_injuries(
     injuries["status"] = _standardize_status(
         injuries.get("injury_status", injuries.get("practice", injuries.get("report_status", "")))
     )
+    weights = status_weights or DEFAULT_STATUS_WEIGHTS
+
     if include_statuses:
         allowed = {status.upper() for status in include_statuses}
         injuries = injuries[injuries["status"].isin(allowed)]
     else:
-        injuries = injuries[injuries["status"].isin(STATUS_WEIGHTS)]
+        injuries = injuries[injuries["status"].isin(weights.keys())]
 
     if injuries.empty:
         return pd.DataFrame(columns=[field for field in InjuryAdjustment.__annotations__.keys()])
@@ -177,15 +206,16 @@ def summarize_injuries(
     if "team_inj" in merged.columns:
         merged.drop(columns="team_inj", inplace=True)
     merged["team"] = _standardize_team(merged["team"])
-    merged["status_weight"] = merged["status"].map(STATUS_WEIGHTS).fillna(0)
+    merged["status_weight"] = merged["status"].map(weights).fillna(0)
     merged["penalty"] = np.clip(merged["impact_score"] * merged["status_weight"], 0, 1)
+    merged = apply_position_weight(merged)
 
     return merged.rename(columns={"player_name": "player_name"})[
-        ["team", "player_id", "player_name", "position", "status", "impact_score", "penalty"]
+        ["team", "player_id", "player_name", "position", "status", "impact_score", "penalty", "position_weight"]
     ].sort_values("penalty", ascending=False)
 
 
-def team_penalties(adjustments: pd.DataFrame, *, cap: float = 0.35) -> pd.DataFrame:
+def team_penalties(adjustments: pd.DataFrame, *, cap: float = TEAM_PENALTY_CAP) -> pd.DataFrame:
     """Aggregate superstar penalties by team for downstream model adjustments."""
 
     if adjustments.empty:
@@ -208,7 +238,8 @@ def build_alert_messages(adjustments: pd.DataFrame) -> list[str]:
     messages = []
     for row in adjustments.itertuples(index=False):
         penalty_pct = row.penalty * 100
+        pos_weight = getattr(row, "position_weight", DEFAULT_POSITION_WEIGHT)
         messages.append(
-            f"{row.team}: {row.player_name} ({row.position}) listed as {row.status.title()} — impact penalty {penalty_pct:.1f}%"
+            f"{row.team}: {row.player_name} ({row.position}) listed as {row.status.title()} — weighted penalty {penalty_pct:.1f}% (pos wt {pos_weight:.2f})"
         )
     return messages

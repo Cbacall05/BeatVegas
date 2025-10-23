@@ -92,10 +92,21 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 DEFAULT_TRAIN_SEASONS = list(range(2018, 2025))
 CURRENT_SEASON = max(datetime.now().year, 2025)
-LOGIT_SHIFT_SCALE = 3.5
+LOGIT_SHIFT_SCALE = 2.1
 MANUAL_INJURY_PATH = ROOT_DIR / "configs" / "manual_injuries.csv"
 DEFAULT_SPREAD_SLOPE = 6.9
 DEFAULT_SPREAD_INTERCEPT = -0.5
+MANUAL_QB_OVERRIDES = {
+    "DEN": "Bo Nix",
+    "NYG": "Jaxson Dart",
+    "CIN": "Joe Flacco",
+    "NYJ": "Justin Fields",
+}
+
+if "_cache_initialized" not in st.session_state:
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    st.session_state["_cache_initialized"] = True
 
 TEAM_ABBREVIATIONS = [
     "ARI",
@@ -214,7 +225,7 @@ def _load_manual_injury_adjustments() -> pd.DataFrame:
     manual_df["impact_score"] = manual_df["impact_score"].astype(float).clip(lower=0.0, upper=1.0)
 
     status_weights = {
-        key: float(value) for key, value in injury_impact.STATUS_WEIGHTS.items()
+        key: float(value) for key, value in injury_impact.DEFAULT_STATUS_WEIGHTS.items()
     }
     weight_series = manual_df["status"].map(status_weights).fillna(0.5)
     if "penalty" in manual_df.columns:
@@ -223,10 +234,18 @@ def _load_manual_injury_adjustments() -> pd.DataFrame:
         manual_df["penalty"] = np.nan
     manual_df["penalty"] = manual_df["penalty"].where(manual_df["penalty"].notna(), manual_df["impact_score"] * weight_series)
     manual_df["penalty"] = manual_df["penalty"].astype(float).clip(lower=0.0, upper=1.0)
+    manual_df = injury_impact.apply_position_weight(manual_df)
 
-    return manual_df[
-        ["team", "player_id", "player_name", "position", "status", "impact_score", "penalty"]
-    ]
+    return manual_df[[
+        "team",
+        "player_id",
+        "player_name",
+        "position",
+        "status",
+        "impact_score",
+        "penalty",
+        "position_weight",
+    ]]
 
 
 @st.cache_data(show_spinner=False)
@@ -288,16 +307,23 @@ def _latest_injury_records(
     return latest
 
 
-def _manual_override_fallback(alerts: list[str], note: str) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
-    manual_adjustments = _load_manual_injury_adjustments()
+def _manual_override_fallback(
+    alerts: list[str],
+    note: str,
+    manual_df: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    manual_adjustments = manual_df if manual_df is not None else _load_manual_injury_adjustments()
     if manual_adjustments.empty:
         return pd.DataFrame(), pd.DataFrame(), alerts
     penalties = injury_impact.team_penalties(manual_adjustments)
     alerts.append(note)
+    manual_names = sorted({name for name in manual_adjustments["player_name"].astype(str) if name})
+    if manual_names:
+        message = "Manual overrides applied for: {}.".format(", ".join(manual_names))
+        if message not in alerts:
+            alerts.append(message)
     alerts.extend(injury_impact.build_alert_messages(manual_adjustments))
     return manual_adjustments, penalties, alerts
-
-
 def prepare_injury_context(
     train_seasons: tuple[int, ...],
     validation_season: int,
@@ -307,26 +333,59 @@ def prepare_injury_context(
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
     seasons_for_data = tuple(sorted(set(train_seasons + (validation_season,))))
     alerts: list[str] = []
+    manual_overrides = _load_manual_injury_adjustments()
 
     try:
         injury_df = load_injuries_cached(seasons_for_data)
     except Exception as exc:  # noqa: BLE001 - present to UI
         alerts.append(f"Injury data unavailable: {exc}")
-        return pd.DataFrame(), pd.DataFrame(), alerts
+        return _manual_override_fallback(
+            alerts,
+            "Using manual injury overrides while live data is unavailable.",
+            manual_overrides,
+        )
+
+    injury_skipped = getattr(injury_df, "attrs", {}).get("skipped_seasons") if injury_df is not None else None
+    if injury_skipped:
+        skipped_str = ", ".join(str(season) for season in injury_skipped)
+        alerts.append(
+            f"Injury reports not available from nfl_data_py for seasons: {skipped_str}. Falling back to prior data where possible."
+        )
 
     if injury_df.empty:
-        return _manual_override_fallback(alerts, "Using manual injury overrides while live data is unavailable.")
+        adjustments, penalties, alerts = _manual_override_fallback(
+            alerts,
+            "Using manual injury overrides while live data is unavailable.",
+            manual_overrides,
+        )
+        return adjustments, penalties, alerts
 
     try:
         weekly_df = load_weekly_cached(seasons_for_data)
     except Exception as exc:  # noqa: BLE001 - present to UI
         alerts.append(f"Weekly player data unavailable for injury adjustments: {exc}")
-        return pd.DataFrame(), pd.DataFrame(), alerts
+        return _manual_override_fallback(
+            alerts,
+            "Using manual injury overrides (weekly data unavailable).",
+            manual_overrides,
+        )
+
+    skipped = getattr(weekly_df, "attrs", {}).get("skipped_seasons")
+    if skipped:
+        skipped_list = ", ".join(str(season) for season in skipped)
+        alerts.append(
+            f"Weekly stats not yet published for seasons: {skipped_list}. Using historical data from the remaining seasons."
+        )
 
     usage_df = injury_impact.compute_usage_profile(weekly_df, lookback_games=lookback_games)
     superstars = injury_impact.select_superstars(usage_df)
     if superstars.empty:
-        return pd.DataFrame(), pd.DataFrame(), alerts
+        adjustments, penalties, alerts = _manual_override_fallback(
+            alerts,
+            "Using manual injury overrides (insufficient usage data).",
+            manual_overrides,
+        )
+        return adjustments, penalties, alerts
 
     latest_injuries = _latest_injury_records(
         injury_df,
@@ -334,13 +393,55 @@ def prepare_injury_context(
         week=week,
     )
     if latest_injuries.empty:
-        return _manual_override_fallback(alerts, "Using manual injury overrides (no recent injury reports).")
+        adjustments, penalties, alerts = _manual_override_fallback(
+            alerts,
+            "Using manual injury overrides (no recent injury reports).",
+            manual_overrides,
+        )
+        return adjustments, penalties, alerts
 
     adjustments = injury_impact.summarize_injuries(latest_injuries, superstars)
     if adjustments.empty:
-        return _manual_override_fallback(alerts, "Using manual injury overrides (no superstar injuries detected).")
+        adjustments, penalties, alerts = _manual_override_fallback(
+            alerts,
+            "Using manual injury overrides (no superstar injuries detected).",
+            manual_overrides,
+        )
+        return adjustments, penalties, alerts
 
+    def _combine_adjustments(auto_df: pd.DataFrame, manual_df: pd.DataFrame) -> pd.DataFrame:
+        if manual_df.empty:
+            return auto_df
+
+        manual = manual_df.copy()
+        manual["team"] = manual["team"].astype(str).str.upper()
+        manual["player_name"] = manual["player_name"].astype(str)
+        manual["_priority"] = 0
+        manual["_name_key"] = manual["player_name"].str.lower().str.strip()
+
+        if auto_df.empty:
+            return manual.drop(columns=["_priority", "_name_key"], errors="ignore")
+
+        automated = auto_df.copy()
+        automated["team"] = automated["team"].astype(str).str.upper()
+        automated["player_name"] = automated["player_name"].astype(str)
+        automated["_priority"] = 1
+        automated["_name_key"] = automated["player_name"].str.lower().str.strip()
+
+        combined = pd.concat([manual, automated], ignore_index=True, sort=False)
+        combined.sort_values(["team", "_name_key", "_priority"], inplace=True)
+        combined = combined.drop_duplicates(subset=["team", "_name_key"], keep="first")
+        combined.drop(columns=["_priority", "_name_key"], inplace=True, errors="ignore")
+        return combined
+
+    adjustments = _combine_adjustments(adjustments, manual_overrides)
     penalties = injury_impact.team_penalties(adjustments)
+    if not manual_overrides.empty:
+        manual_names = sorted({name for name in manual_overrides["player_name"].astype(str) if name})
+        if manual_names:
+            message = "Manual overrides applied for: {}.".format(", ".join(manual_names))
+            if message not in alerts:
+                alerts.append(message)
     alerts.extend(injury_impact.build_alert_messages(adjustments))
     return adjustments, penalties, alerts
 
@@ -513,16 +614,17 @@ def build_player_prop_predictions(
             if "player_name" in injury_adjustments.columns
             else pd.Series(dtype=str)
         )
-        inactive_name_set = set(inactive_names)
+        inactive_name_set = {name.strip() for name in inactive_names if name}
         if not inactive_players and not inactive_name_set:
             return df
         before = len(df)
-        mask_id = ~df["player_id"].astype(str).isin(inactive_players)
-        if inactive_name_set and "player_display_name" in df.columns:
-            mask_name = ~df["player_display_name"].astype(str).str.lower().isin(inactive_name_set)
-            mask_combined = mask_id & mask_name
-        else:
-            mask_combined = mask_id
+        mask_combined = ~df["player_id"].astype(str).isin(inactive_players)
+        if inactive_name_set:
+            name_mask = pd.Series(True, index=df.index)
+            for col in ("player_display_name", "player_name", "roster_player_name"):
+                if col in df.columns:
+                    name_mask &= ~df[col].astype(str).str.lower().str.strip().isin(inactive_name_set)
+            mask_combined &= name_mask
         filtered = df[mask_combined]
         removed = before - len(filtered)
         if removed > 0:
@@ -533,6 +635,17 @@ def build_player_prop_predictions(
                 )
             )
         return filtered
+
+    def _apply_manual_qb_overrides(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty or "team" not in df.columns or "player_display_name" not in df.columns:
+            return df
+        updated = df.copy()
+        teams_upper = updated["team"].astype(str).str.upper()
+        for team, override_name in MANUAL_QB_OVERRIDES.items():
+            mask = teams_upper == team
+            if mask.any():
+                updated.loc[mask, "player_display_name"] = override_name
+        return updated
 
     try:
         model_result, _, upcoming = player_models.train_and_predict_touchdowns(
@@ -561,8 +674,10 @@ def build_player_prop_predictions(
             lookback=lookback,
             min_attempts=12.0,
             roster_df=roster_df,
+            preferred_qbs=MANUAL_QB_OVERRIDES,
         )
         passing_upcoming = _apply_injury_filter(passing_upcoming, "passing yards")
+        passing_upcoming = _apply_manual_qb_overrides(passing_upcoming)
         props_by_type["passing_yards"] = passing_upcoming
         metrics_by_type["passing_yards"] = pass_result.metrics
     except Exception as exc:  # noqa: BLE001 - present error to UI
@@ -635,7 +750,7 @@ def render_sidebar():
         )
 
 
-def render_injury_spotlight(
+def render_injury_tables(
     adjustments: pd.DataFrame,
     team_penalties: pd.DataFrame,
     alerts: list[str],
@@ -643,13 +758,13 @@ def render_injury_spotlight(
     if not alerts and (adjustments is None or adjustments.empty) and (team_penalties is None or team_penalties.empty):
         return
 
-    st.markdown("### Injury Spotlight")
+    st.markdown("### Injury Report")
 
-    for message in alerts:
-        st.warning(message)
+    if alerts:
+        st.caption(" • ".join(alerts))
 
     if adjustments is not None and not adjustments.empty:
-        st.caption("Superstar injuries impacting current projections")
+        st.caption("Player-level impact overrides")
         display_cols = [
             "team",
             "player_name",
@@ -657,6 +772,7 @@ def render_injury_spotlight(
             "status",
             "impact_score",
             "penalty",
+            "position_weight",
         ]
         display_df = adjustments[display_cols].copy()
         display_df.rename(
@@ -666,21 +782,130 @@ def render_injury_spotlight(
                 "position": "Pos",
                 "status": "Status",
                 "impact_score": "Usage Impact",
-                "penalty": "Penalty",
+                "penalty": "Weighted Penalty",
+                "position_weight": "Pos Weight",
             },
             inplace=True,
         )
         display_df["Usage Impact"] = display_df["Usage Impact"].astype(float).map(lambda v: f"{v:.2f}")
-        display_df["Penalty"] = display_df["Penalty"].astype(float).map(lambda v: f"{v * 100:.1f}%")
-        st.dataframe(display_df, hide_index=True, use_container_width=True)
+        display_df["Weighted Penalty"] = display_df["Weighted Penalty"].astype(float).map(lambda v: f"{v * 100:.1f}%")
+        display_df["Pos Weight"] = display_df["Pos Weight"].astype(float).map(lambda v: f"{v:.2f}")
+        st.dataframe(display_df, hide_index=True, width="stretch")
 
     if team_penalties is not None and not team_penalties.empty:
-        st.caption("Aggregated penalty applied per team")
+        st.caption("Team penalty summary")
         penalty_df = team_penalties.copy()
         penalty_df.rename(columns={"team": "Team", "penalty": "Penalty"}, inplace=True)
         penalty_df["Penalty"] = penalty_df["Penalty"].astype(float).map(lambda v: f"{v * 100:.1f}%")
-        st.dataframe(penalty_df, hide_index=True, use_container_width=True)
+        st.dataframe(penalty_df, hide_index=True, width="stretch")
 
+
+def render_debug_panel(
+    team_code: str,
+    team_df: pd.DataFrame,
+    schedule_df: pd.DataFrame,
+    predictions: pd.DataFrame,
+    *,
+    validation_season: int,
+    week: int,
+) -> None:
+    st.markdown("### Debugging Snapshot")
+    team = (team_code or "").strip().upper()
+    if not team:
+        st.info("Enter a team abbreviation to inspect.")
+        return
+
+    st.caption(f"Inspecting team: {team}")
+
+    recent_df = team_df[team_df.get("team", "").str.upper() == team]
+    if recent_df.empty:
+        st.warning("No team strength data found for this abbreviation.")
+    else:
+        display_cols = [col for col in [
+            "season",
+            "week",
+            "team",
+            "opponent",
+            "rolling_offense",
+            "rolling_defense",
+            "market_spread",
+            "market_total",
+        ] if col in recent_df.columns]
+        preview = (
+            recent_df.sort_values(["season", "week"], ascending=[False, False])
+            .head(8)
+            .loc[:, display_cols]
+        )
+        st.markdown("#### Recent team metrics")
+        st.dataframe(preview, hide_index=True, width="stretch")
+
+    upcoming = schedule_df[
+        (schedule_df["season"] == validation_season)
+        & (schedule_df["week"] == week)
+        & (
+            (schedule_df["home_team"].str.upper() == team)
+            | (schedule_df["away_team"].str.upper() == team)
+        )
+    ]
+    if upcoming.empty:
+        st.info("No schedule entry for the selected team/week.")
+    else:
+        st.markdown("#### Upcoming schedule entry")
+        sched_cols = [col for col in [
+            "game_id",
+            "gameday",
+            "home_team",
+            "away_team",
+            "spread_line",
+            "market_total",
+            "home_moneyline",
+            "away_moneyline",
+        ] if col in upcoming.columns]
+        st.dataframe(upcoming.loc[:, sched_cols], hide_index=True, width="stretch")
+
+    game_predictions = predictions[
+        (predictions.get("home_team", "").str.upper() == team)
+        | (predictions.get("away_team", "").str.upper() == team)
+    ]
+    if game_predictions.empty:
+        st.info("No prediction row generated for this team.")
+        return
+
+    debug_cols = [col for col in [
+        "game_id",
+        "home_team",
+        "away_team",
+        "raw_home_win_prob",
+        "avg_home_win_prob",
+        "avg_away_win_prob",
+        "injury_penalty_home",
+        "injury_penalty_away",
+        "injury_penalty_net",
+        "model_spread",
+        "market_spread",
+        "predicted_winner",
+        "predicted_win_prob",
+    ] if col in game_predictions.columns]
+    st.markdown("#### Win probability comparison (raw vs adjusted)")
+    display = game_predictions.loc[:, debug_cols].copy()
+    prob_cols = [
+        "raw_home_win_prob",
+        "avg_home_win_prob",
+        "avg_away_win_prob",
+        "predicted_win_prob",
+    ]
+    for col in prob_cols:
+        if col in display.columns:
+            display[col] = display[col].astype(float).map(lambda v: f"{v:.3f}")
+    penalty_cols = ["injury_penalty_home", "injury_penalty_away", "injury_penalty_net"]
+    for col in penalty_cols:
+        if col in display.columns:
+            display[col] = display[col].astype(float).map(lambda v: f"{v:.3f}")
+    if "model_spread" in display.columns:
+        display["model_spread"] = display["model_spread"].astype(float).map(lambda v: f"{v:+.2f}")
+    if "market_spread" in display.columns:
+        display["market_spread"] = display["market_spread"].astype(float).map(lambda v: f"{v:+.2f}")
+    st.dataframe(display, hide_index=True, width="stretch")
 
 def render_metrics(predictions: pd.DataFrame, team_filter: list[str]):
     if predictions.empty:
@@ -747,7 +972,7 @@ def render_metrics(predictions: pd.DataFrame, team_filter: list[str]):
                 "market_total": "Market Total",
             }
         ),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -769,7 +994,7 @@ def render_metrics(predictions: pd.DataFrame, team_filter: list[str]):
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)",
     )
-    st.plotly_chart(chart, use_container_width=True)
+    st.plotly_chart(chart, width="stretch")
 
     st.markdown("### Raw Prediction Details")
     probability_cols = [col for col in predictions.columns if col.endswith("_home_win")]
@@ -806,7 +1031,7 @@ def render_metrics(predictions: pd.DataFrame, team_filter: list[str]):
         if col in formatted:
             formatted[col] = formatted[col].map(lambda v: f"{v:.3f}" if pd.notna(v) else "–")
 
-    st.dataframe(formatted, use_container_width=True)
+    st.dataframe(formatted, width="stretch")
 
 
 def render_totals_section(predictions: pd.DataFrame):
@@ -870,7 +1095,7 @@ def render_totals_section(predictions: pd.DataFrame):
                 "total_edge": "Edge vs Market",
             }
         ),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -932,7 +1157,7 @@ def render_totals_section(predictions: pd.DataFrame):
             plot_bgcolor="rgba(0,0,0,0)",
             paper_bgcolor="rgba(0,0,0,0)",
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
         col_mean, col_std, col_edge = st.columns(3)
         col_mean.metric("Ensemble Total", f"{mean_total:.1f}")
@@ -963,7 +1188,7 @@ def render_totals_section(predictions: pd.DataFrame):
             if col in per_model_df:
                 per_model_df[col] = per_model_df[col].astype(float).round(2)
         st.markdown("#### Model Breakdown")
-        st.dataframe(per_model_df, hide_index=True, use_container_width=True)
+    st.dataframe(per_model_df, hide_index=True, width="stretch")
 
 
 def render_spreads_section(predictions: pd.DataFrame):
@@ -1001,7 +1226,7 @@ def render_spreads_section(predictions: pd.DataFrame):
         .rename(columns={"week": "Week", "home_team": "Home", "away_team": "Away"})
         .sort_values("Week"),
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
     )
 
     edge_numeric = table["model_spread"] - table["market_spread"]
@@ -1021,7 +1246,9 @@ def render_spreads_section(predictions: pd.DataFrame):
             margin=dict(l=10, r=10, t=40, b=40),
             coloraxis_showscale=False,
         )
-        st.plotly_chart(spread_chart, use_container_width=True)
+        st.plotly_chart(spread_chart, width="stretch")
+    else:
+        st.info("No spread mispricing bars to visualize this week.")
 
 
 def render_player_props(
@@ -1150,14 +1377,14 @@ def render_touchdown_prop_details(
         home_df[["player_display_name", "position", "TD %", "Touches", "Rush Att", "Targets", "Red Zone"]]
         .rename(columns={"player_display_name": "Player", "position": "Pos"}),
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
     )
     cols[1].markdown(f"**{away_team} (Away)**")
     cols[1].dataframe(
         away_df[["player_display_name", "position", "TD %", "Touches", "Rush Att", "Targets", "Red Zone"]]
         .rename(columns={"player_display_name": "Player", "position": "Pos"}),
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
     )
 
     st.markdown("#### Probability Landscape")
@@ -1182,7 +1409,7 @@ def render_touchdown_prop_details(
         margin=dict(l=90, r=20, t=30, b=40),
         showlegend=False,
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     st.caption(
         "Probabilities reflect the chance that a player scores at least one touchdown, based on recent usage trends and the upcoming game's context."
@@ -1231,14 +1458,14 @@ def render_passing_yards_prop_details(
         home_df[["player_display_name", "Expected Yards", "Avg Attempts", "Avg Completions", "Avg TD", "Avg INT"]]
         .rename(columns={"player_display_name": "Quarterback"}),
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
     )
     cols[1].markdown(f"**{away_team} (Away)**")
     cols[1].dataframe(
         away_df[["player_display_name", "Expected Yards", "Avg Attempts", "Avg Completions", "Avg TD", "Avg INT"]]
         .rename(columns={"player_display_name": "Quarterback"}),
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
     )
 
     st.markdown("#### Yardage Distribution")
@@ -1263,7 +1490,7 @@ def render_passing_yards_prop_details(
         margin=dict(l=90, r=20, t=30, b=40),
         showlegend=False,
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     st.caption(
         "Projections combine recent quarterback usage with market context to estimate expected passing yards."
@@ -1272,6 +1499,13 @@ def render_passing_yards_prop_details(
 def main() -> None:
     render_header()
     train_seasons, validation_season, rolling_window, week, team_filter = render_sidebar()
+    if st.sidebar.button("Clear cached data and rerun"):
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        st.session_state["_cache_initialized"] = True
+        st.experimental_rerun()
+
+    debug_team = st.sidebar.text_input("Debug Team (e.g., NYJ)", value="NYJ")
     injury_adjustments = pd.DataFrame()
     team_penalties = pd.DataFrame()
     injury_alerts: list[str] = []
@@ -1279,6 +1513,8 @@ def main() -> None:
     player_props: dict[str, pd.DataFrame] = {}
     player_metrics: dict[str, dict[str, float]] = {}
     player_issues: list[str] = []
+    schedule_df = pd.DataFrame()
+    team_df = pd.DataFrame()
 
     with st.spinner("Training models and generating predictions..."):
         injury_adjustments, team_penalties, injury_alerts = prepare_injury_context(
@@ -1318,9 +1554,11 @@ def main() -> None:
             injury_adjustments=injury_adjustments,
         )
 
-    render_injury_spotlight(injury_adjustments, team_penalties, injury_alerts)
+    render_injury_tables(injury_adjustments, team_penalties, injury_alerts)
 
-    matchups_tab, spreads_tab, totals_tab, props_tab = st.tabs(["Matchups", "Spreads", "Totals", "Player Props"])
+    matchups_tab, spreads_tab, totals_tab, props_tab, debug_tab = st.tabs(
+        ["Matchups", "Spreads", "Totals", "Player Props", "Debug"]
+    )
 
     with matchups_tab:
         render_metrics(predictions, team_filter)
@@ -1336,6 +1574,15 @@ def main() -> None:
             week,
             player_metrics,
             player_issues,
+        )
+    with debug_tab:
+        render_debug_panel(
+            debug_team,
+            team_df,
+            schedule_df,
+            predictions,
+            validation_season=validation_season,
+            week=week,
         )
 
     st.caption(

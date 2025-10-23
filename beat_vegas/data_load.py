@@ -27,11 +27,12 @@ if _nfl_data_py is not None:  # pragma: no branch - simple attribute lookups.
     import_schedules = getattr(_nfl_data_py, "import_schedules", None)
     import_weekly_data = getattr(_nfl_data_py, "import_weekly_data", None)
     import_injuries = getattr(_nfl_data_py, "import_injuries", None)
+    import_snap_counts = getattr(_nfl_data_py, "import_snap_counts", None)
     import_rosters = getattr(_nfl_data_py, "import_rosters", None) or getattr(
         _nfl_data_py, "import_seasonal_rosters", None
     )
 else:
-    import_pbp_data = import_schedules = import_weekly_data = import_rosters = import_injuries = None
+    import_pbp_data = import_schedules = import_weekly_data = import_rosters = import_injuries = import_snap_counts = None
 
 
 def _ensure_nfl_data_py_available() -> None:
@@ -82,7 +83,43 @@ def load_weekly_data(seasons: Iterable[int], columns: Optional[list[str]] = None
     _ensure_nfl_data_py_available()
     seasons_list = _validate_seasons(seasons)
     LOGGER.info("Loading weekly data for seasons: %s", seasons_list)
-    weekly_df = import_weekly_data(seasons_list)
+    frames: list[pd.DataFrame] = []
+    skipped: list[int] = []
+
+    for season in seasons_list:
+        try:
+            season_df = import_weekly_data([season])
+        except HTTPError as exc:  # pragma: no cover - network dependent
+            LOGGER.warning("Weekly endpoint returned HTTP error %s for %s; skipping season.", exc, season)
+            skipped.append(season)
+            continue
+        except Exception as exc:  # noqa: BLE001 - propagate unexpected issues
+            message = str(exc)
+            if "404" in message or "Not Found" in message:
+                LOGGER.warning("Weekly endpoint returned 404 for season %s; skipping season.", season)
+                skipped.append(season)
+                continue
+            raise
+
+        if season_df is None or season_df.empty:
+            LOGGER.warning("Weekly endpoint returned no rows for season %s.", season)
+            skipped.append(season)
+            continue
+
+        frames.append(season_df)
+
+    if not frames:
+        raise RuntimeError(
+            "No weekly player stats available for the requested seasons."
+            " Try adding completed seasons or waiting for nfl_data_py to publish the latest week."
+        )
+
+    weekly_df = pd.concat(frames, ignore_index=True)
+
+    if skipped:
+        LOGGER.info("Weekly data skipped for seasons without coverage: %s", skipped)
+        weekly_df.attrs["skipped_seasons"] = tuple(skipped)
+
     if columns:
         missing_columns = [col for col in columns if col not in weekly_df.columns]
         if missing_columns:
@@ -137,21 +174,41 @@ def load_injuries(seasons: Iterable[int]) -> pd.DataFrame:
 
     seasons_list = _validate_seasons(seasons)
     LOGGER.info("Loading injuries for seasons: %s", seasons_list)
-    try:
-        injury_df = import_injuries(seasons_list)
-    except HTTPError as exc:  # pragma: no cover - network dependent
-        LOGGER.warning("Injury endpoint returned HTTP error %s; continuing without injuries.", exc)
-        return pd.DataFrame()
-    except Exception as exc:  # noqa: BLE001 - propagate unexpected issues
-        message = str(exc)
-        if "404" in message or "Not Found" in message:
-            LOGGER.warning("Injury endpoint returned 404 for seasons %s; continuing without injuries.", seasons_list)
-            return pd.DataFrame()
-        raise
 
-    if injury_df.empty:
-        LOGGER.warning("Injury endpoint returned no rows for the requested seasons: %s", seasons_list)
-        return injury_df
+    frames: list[pd.DataFrame] = []
+    skipped: list[int] = []
+    for season in seasons_list:
+        try:
+            season_df = import_injuries([season])
+        except HTTPError as exc:  # pragma: no cover - network dependent
+            LOGGER.warning("Injury endpoint returned HTTP error %s for %s; skipping season.", exc, season)
+            skipped.append(season)
+            continue
+        except Exception as exc:  # noqa: BLE001 - propagate unexpected issues
+            message = str(exc)
+            if "404" in message or "Not Found" in message:
+                LOGGER.warning("Injury endpoint returned 404 for season %s; skipping season.", season)
+                skipped.append(season)
+                continue
+            raise
+
+        if season_df is None or season_df.empty:
+            LOGGER.warning("Injury endpoint returned no rows for season %s.", season)
+            skipped.append(season)
+            continue
+
+        frames.append(season_df)
+
+    if not frames:
+        LOGGER.warning("No injury data available for requested seasons: %s", seasons_list)
+        empty = pd.DataFrame()
+        if skipped:
+            empty.attrs["skipped_seasons"] = tuple(skipped)
+        return empty
+
+    injury_df = pd.concat(frames, ignore_index=True)
+    if skipped:
+        injury_df.attrs["skipped_seasons"] = tuple(skipped)
 
     injury_df = injury_df.copy()
     if "gsis_id" in injury_df.columns and "player_id" not in injury_df.columns:

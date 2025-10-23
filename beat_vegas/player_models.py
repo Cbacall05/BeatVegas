@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Mapping
 
 import numpy as np
 import pandas as pd
@@ -76,14 +76,36 @@ def _prepare_roster_lookup(
         roster = roster[~roster["status"].isin(EXCLUDED_STATUSES)]
 
     if "season" in roster.columns:
-        roster = roster[roster["season"] == target_season]
+        season_mask = roster["season"] == target_season
+        if season_mask.any():
+            roster = roster[season_mask]
+        else:
+            latest_season = pd.to_numeric(roster["season"], errors="coerce").max()
+            if not pd.isna(latest_season):
+                roster = roster[roster["season"] == latest_season]
 
     if "week" in roster.columns:
+        roster_before_week = roster.copy()
         roster = roster[roster["week"] <= target_week]
-        roster = roster.sort_values([player_id_col, "week"]).drop_duplicates(player_id_col, keep="last")
+        if roster.empty:
+            roster = roster_before_week.sort_values([player_id_col, "week"]).drop_duplicates(player_id_col, keep="last")
+        else:
+            roster = roster.sort_values([player_id_col, "week"]).drop_duplicates(player_id_col, keep="last")
 
-    roster = roster[[player_id_col, team_col]].drop_duplicates()
-    roster.rename(columns={player_id_col: "player_id", team_col: "team"}, inplace=True)
+    column_map = {player_id_col: "player_id", team_col: "team"}
+    if "player_name" in roster.columns:
+        column_map["player_name"] = "roster_player_name"
+    if "football_name" in roster.columns and "player_name" not in roster.columns:
+        column_map["football_name"] = "roster_player_name"
+    if "position" in roster.columns:
+        column_map["position"] = "roster_position"
+    if "depth_chart_position" in roster.columns:
+        column_map["depth_chart_position"] = "depth_chart_position"
+    if "years_exp" in roster.columns:
+        column_map["years_exp"] = "years_exp"
+
+    roster = roster[list(column_map.keys())].drop_duplicates(subset=[player_id_col, team_col], keep="last")
+    roster.rename(columns=column_map, inplace=True)
     return roster
 
 
@@ -592,7 +614,184 @@ def _aggregate_recent_passing_usage(
     grouped["avg_passing_yards"] = grouped["avg_passing_yards"].fillna(0.0)
     grouped["avg_market_total"] = grouped["avg_market_total"].fillna(0.0)
     grouped["avg_spread_line"] = grouped["avg_spread_line"].fillna(0.0)
+    grouped["is_fallback"] = False
     return grouped
+
+
+def _compute_team_passing_baselines(
+    qb_stats: pd.DataFrame,
+    target_season: int,
+    target_week: int,
+    lookback: int,
+) -> pd.DataFrame:
+    history_mask = (qb_stats["season"] < target_season) | (
+        (qb_stats["season"] == target_season) & (qb_stats["week"] < target_week)
+    )
+    history = qb_stats.loc[history_mask].copy()
+    if history.empty:
+        return pd.DataFrame()
+
+    history = history[history["team"].fillna("").str.upper() != "TOT"].copy()
+    history["team"] = history["team"].astype(str).str.upper()
+
+    aggregations = {
+        "pass_attempts": _safe_sum,
+        "completions": _safe_sum,
+        "passing_yards": _safe_sum,
+        "interceptions": _safe_sum,
+        "passing_touchdowns": _safe_sum,
+        "market_total": "mean",
+        "spread_line": "mean",
+    }
+    team_games = (
+        history.groupby(["team", "season", "week"], as_index=False)
+        .agg(aggregations)
+        .sort_values(["team", "season", "week"])
+    )
+
+    for col in [
+        "pass_attempts",
+        "completions",
+        "passing_yards",
+        "interceptions",
+        "passing_touchdowns",
+        "market_total",
+        "spread_line",
+    ]:
+        team_games[f"avg_{col}"] = (
+            team_games.groupby("team")[col]
+            .apply(lambda s: s.shift(1).rolling(window=lookback, min_periods=1).mean())
+            .reset_index(level=0, drop=True)
+        )
+
+    latest = team_games.groupby("team", as_index=False).tail(1).copy()
+    latest.rename(
+        columns={
+            "avg_pass_attempts": "avg_pass_attempts",
+            "avg_completions": "avg_completions",
+            "avg_passing_yards": "avg_passing_yards",
+            "avg_interceptions": "avg_interceptions",
+            "avg_passing_touchdowns": "avg_passing_touchdowns",
+            "avg_market_total": "avg_market_total",
+            "avg_spread_line": "avg_spread_line",
+        },
+        inplace=True,
+    )
+
+    latest = latest[[
+        "team",
+        "avg_pass_attempts",
+        "avg_completions",
+        "avg_passing_yards",
+        "avg_interceptions",
+        "avg_passing_touchdowns",
+        "avg_market_total",
+        "avg_spread_line",
+    ]].copy()
+    return latest
+
+
+def _build_qb_fallback_usage(
+    upcoming: pd.DataFrame,
+    usage: pd.DataFrame,
+    roster_lookup: pd.DataFrame,
+    team_baselines: pd.DataFrame,
+    preferred_qbs: Optional[Mapping[str, str]] = None,
+) -> pd.DataFrame:
+    if upcoming.empty or roster_lookup.empty:
+        return pd.DataFrame()
+
+    upcoming_teams = set(upcoming["team"].unique())
+    existing_teams = set(usage["team"].unique()) if not usage.empty else set()
+    missing_teams = upcoming_teams - existing_teams
+
+    preferred_map = {team.upper(): name.strip().lower() for team, name in (preferred_qbs or {}).items()}
+
+    if usage is not None and not usage.empty and preferred_map:
+        usage_names = usage.assign(
+            _display=usage["player_display_name"].astype(str).str.lower()
+        )
+        for team, name in preferred_map.items():
+            if team not in upcoming_teams:
+                continue
+            team_mask = usage_names["team"].astype(str).str.upper() == team
+            if not team_mask.any():
+                missing_teams.add(team)
+                continue
+            if name not in set(usage_names.loc[team_mask, "_display"]):
+                missing_teams.add(team)
+    if not missing_teams:
+        return pd.DataFrame()
+
+    baseline_cols = [
+        "avg_pass_attempts",
+        "avg_completions",
+        "avg_passing_yards",
+        "avg_interceptions",
+        "avg_passing_touchdowns",
+        "avg_market_total",
+        "avg_spread_line",
+    ]
+
+    default_baseline = team_baselines[baseline_cols].mean().to_dict() if not team_baselines.empty else {}
+    default_baseline = {col: float(default_baseline.get(col, 0.0)) for col in baseline_cols}
+
+    rows: list[dict[str, object]] = []
+    roster_qbs = roster_lookup[
+        (roster_lookup.get("roster_position").fillna("").str.upper() == "QB")
+        | (roster_lookup.get("depth_chart_position").fillna("").str.upper() == "QB")
+    ].copy()
+    roster_qbs["team"] = roster_qbs["team"].astype(str).str.upper()
+    roster_qbs["roster_player_name"] = roster_qbs.get("roster_player_name").astype(str)
+
+    for team in sorted(missing_teams):
+        team_baseline_row = team_baselines[team_baselines["team"] == team]
+        if not team_baseline_row.empty:
+            baseline = team_baseline_row.iloc[0].to_dict()
+        else:
+            baseline = default_baseline
+
+        candidates = roster_qbs[roster_qbs["team"] == team].copy()
+        if candidates.empty:
+            continue
+
+        candidates["years_exp"] = pd.to_numeric(candidates.get("years_exp"), errors="coerce")
+        candidates["years_exp"] = candidates["years_exp"].fillna(10.0)
+        pref_name = preferred_map.get(team)
+        chosen: pd.Series
+        if pref_name:
+            pref_match = candidates[candidates["roster_player_name"].str.lower() == pref_name]
+            if not pref_match.empty:
+                chosen = pref_match.iloc[0]
+            else:
+                chosen = candidates.sort_values(["years_exp", "roster_player_name"]).iloc[0]
+        else:
+            chosen = candidates.sort_values(["years_exp", "roster_player_name"]).iloc[0]
+
+        display_name = chosen.get("roster_player_name") or chosen.get("player_id") or "Unknown QB"
+
+        row = {
+            "player_id": str(chosen["player_id"]),
+            "player_display_name": str(display_name),
+            "team": team,
+            "opponent": "UNK",
+            "is_fallback": True,
+        }
+        for col in baseline_cols:
+            value = baseline.get(col, default_baseline.get(col, 0.0))
+            if pd.isna(value):
+                value = default_baseline.get(col, 0.0)
+            row[col] = float(value)
+        row["years_exp"] = float(chosen.get("years_exp", 10.0))
+        row["roster_player_name"] = chosen.get("roster_player_name")
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame()
+
+    fallback_df = pd.DataFrame(rows)
+    fallback_df["player_id"] = fallback_df["player_id"].astype(str)
+    return fallback_df
 
 
 def predict_upcoming_touchdowns(
@@ -707,6 +906,7 @@ def predict_upcoming_passing_yards(
     target_season: int,
     target_week: int,
     roster_lookup: Optional[pd.DataFrame] = None,
+    preferred_qbs: Optional[Mapping[str, str]] = None,
 ) -> pd.DataFrame:
     if qb_stats.empty:
         return pd.DataFrame()
@@ -731,9 +931,13 @@ def predict_upcoming_passing_yards(
         lookback=model_result.lookback,
         min_attempts=model_result.min_attempts,
     )
-    if usage.empty:
-        LOGGER.warning("No quarterback usage history to project upcoming passing yards.")
-        return pd.DataFrame()
+
+    team_baselines = _compute_team_passing_baselines(
+        qb_stats,
+        target_season=target_season,
+        target_week=target_week,
+        lookback=model_result.lookback,
+    )
 
     if roster_lookup is not None and not roster_lookup.empty:
         roster_map = roster_lookup[["player_id", "team"]].drop_duplicates()
@@ -741,6 +945,17 @@ def predict_upcoming_passing_yards(
         usage = usage.merge(roster_map, on="player_id", how="left", suffixes=("", "_roster"))
         usage["team"] = usage["team_roster"].where(usage["team_roster"].notna(), usage["team"])
         usage.drop(columns=[col for col in usage.columns if col.endswith("_roster")], inplace=True)
+
+    if roster_lookup is not None and not roster_lookup.empty:
+        fallback_rows = _build_qb_fallback_usage(upcoming, usage, roster_lookup, team_baselines, preferred_qbs)
+        if usage.empty:
+            usage = fallback_rows
+        elif not fallback_rows.empty:
+            usage = pd.concat([usage, fallback_rows], ignore_index=True)
+
+    if usage.empty:
+        LOGGER.warning("No quarterback usage history available; fallback projections unavailable.")
+        return pd.DataFrame()
 
     usage["team"] = usage["team"].astype(str).str.upper()
     upcoming["team"] = upcoming["team"].astype(str).str.upper()
@@ -753,6 +968,7 @@ def predict_upcoming_passing_yards(
         roster_lookup = roster_lookup.copy()
         roster_lookup["team"] = roster_lookup["team"].astype(str).str.upper()
         roster_lookup = roster_lookup.drop_duplicates(subset=["player_id", "team"])
+        roster_lookup = roster_lookup.drop_duplicates(subset=["player_id", "team"], keep="last")
         merged = merged.merge(roster_lookup, on=["player_id", "team"], how="inner")
         if merged.empty:
             LOGGER.warning("No roster overlap found when filtering passing projections.")
@@ -797,9 +1013,34 @@ def predict_upcoming_passing_yards(
         "spread_line",
         "expected_passing_yards",
     ]
+    optional_cols = ["roster_player_name", "years_exp", "is_fallback"]
+    for col in optional_cols:
+        if col in merged.columns and col not in output_cols:
+            output_cols.append(col)
+
     result = merged[output_cols].copy()
-    result.sort_values(["game_id", "expected_passing_yards"], ascending=[True, False], inplace=True)
+    result["selection_rank"] = 1.0
+    if "is_fallback" in result.columns:
+        result.loc[result["is_fallback"].astype(bool), "selection_rank"] = 0.5
+
+    if preferred_qbs:
+        normalized = {team.upper(): name.strip().lower() for team, name in preferred_qbs.items()}
+        player_names = result["player_display_name"].astype(str).str.lower()
+        roster_names = result.get("roster_player_name")
+        roster_names = roster_names.astype(str).str.lower() if roster_names is not None else pd.Series(index=result.index, dtype=str)
+        for team, name in normalized.items():
+            mask_team = result["team"].str.upper() == team
+            if not mask_team.any():
+                continue
+            mask_name = player_names.eq(name)
+            if roster_names is not None:
+                mask_name |= roster_names.eq(name)
+            result.loc[mask_team & mask_name, "selection_rank"] = -1.0
+
+    # Prefer manually prioritized quarterbacks, then highest recent usage
+    result.sort_values(["game_id", "selection_rank", "avg_pass_attempts"], ascending=[True, True, False], inplace=True)
     result = result.groupby(["game_id", "team"], as_index=False, sort=False).head(1)
+    result.drop(columns=[col for col in ["selection_rank"] if col in result.columns], inplace=True)
     return result.reset_index(drop=True)
 
 
@@ -856,6 +1097,7 @@ def train_and_predict_passing_yards(
     lookback: int = 4,
     min_attempts: float = 15.0,
     roster_df: Optional[pd.DataFrame] = None,
+    preferred_qbs: Optional[Mapping[str, str]] = None,
 ) -> tuple[PlayerPassingYardsModelResult, pd.DataFrame, pd.DataFrame]:
     """Wrapper to train and project quarterback passing yards for upcoming games."""
 
@@ -885,5 +1127,6 @@ def train_and_predict_passing_yards(
         target_season=target_season,
         target_week=target_week,
         roster_lookup=roster_lookup,
+        preferred_qbs=preferred_qbs,
     )
     return model_result, dataset, upcoming
