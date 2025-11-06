@@ -55,6 +55,17 @@ class ModelResult:
     calibrated_metrics: Optional[Dict[str, float]] = None
 
 
+@dataclass
+class MoneylineMetaModel:
+    """Holds a trained stacking meta-model and its feature schema."""
+
+    model: Pipeline
+    feature_columns: list[str]
+    prob_columns: list[str]
+    context_columns: list[str]
+    aggregate_columns: list[str]
+
+
 def _ensure_lightgbm_available() -> None:
     if lgb is None:
         raise ImportError("lightgbm is required. Install it via 'pip install lightgbm'.")
@@ -172,6 +183,26 @@ _TOTAL_PREDICTION_CONTEXT_COLUMNS = [
     "away_market_total",
     "home_rest_days",
     "away_rest_days",
+]
+
+_META_CONTEXT_FEATURES = [
+    "week",
+    "home_market_prob",
+    "away_market_prob",
+    "rest_days_diff",
+    "travel_miles_diff",
+    "home_rest_days",
+    "away_rest_days",
+    "home_travel_miles",
+    "away_travel_miles",
+]
+
+_META_AGGREGATE_FEATURES = [
+    "prob_mean",
+    "prob_std",
+    "prob_max",
+    "prob_min",
+    "prob_range",
 ]
 
 
@@ -324,6 +355,106 @@ def train_moneyline_models(
     )
 
     return results
+
+
+def train_moneyline_meta_model(results: Sequence[ModelResult]) -> MoneylineMetaModel | None:
+    """Train a penalised logistic meta-model stacking the base moneyline models."""
+
+    if len(results) < 2:
+        LOGGER.debug("Skipping meta-model training; need at least two base models.")
+        return None
+
+    base_predictions = results[0].predictions
+    if "game_id" not in base_predictions.columns or "actual" not in base_predictions.columns:
+        LOGGER.debug("Base predictions missing game_id or actual columns; cannot train meta-model.")
+        return None
+
+    context_cols = [col for col in _META_CONTEXT_FEATURES if col in base_predictions.columns]
+    meta_df = base_predictions[["game_id", "actual", *context_cols]].copy()
+    prob_columns: list[str] = []
+
+    for result in results:
+        preds = result.predictions
+        if "game_id" not in preds.columns:
+            LOGGER.debug("%s predictions missing game_id column; skipping from meta-model.", result.model_name)
+            continue
+
+        source_col = "calibrated_win_proba" if "calibrated_win_proba" in preds.columns else "pred_win_proba"
+        if source_col not in preds.columns:
+            LOGGER.debug(
+                "%s predictions missing calibrated or raw probabilities; skipping from meta-model.",
+                result.model_name,
+            )
+            continue
+
+        target_col = f"{result.model_name}_prob"
+        join_cols = preds[["game_id", source_col]].rename(columns={source_col: target_col})
+        meta_df = meta_df.merge(join_cols, on="game_id", how="inner")
+        prob_columns.append(target_col)
+
+    if len(prob_columns) < 2:
+        LOGGER.debug("Meta-model requires at least two probability columns; found %d.", len(prob_columns))
+        return None
+
+    if meta_df.empty or meta_df["actual"].nunique() < 2:
+        LOGGER.debug("Insufficient data or variance in outcomes to train meta-model.")
+        return None
+
+    feature_df = meta_df[prob_columns].copy()
+    for col in context_cols:
+        feature_df[col] = meta_df[col]
+
+    prob_df = meta_df[prob_columns]
+    feature_df["prob_mean"] = prob_df.mean(axis=1)
+    feature_df["prob_std"] = prob_df.std(axis=1, ddof=0)
+    feature_df["prob_max"] = prob_df.max(axis=1)
+    feature_df["prob_min"] = prob_df.min(axis=1)
+    feature_df["prob_range"] = feature_df["prob_max"] - feature_df["prob_min"]
+
+    feature_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    feature_columns = list(feature_df.columns)
+    y = meta_df["actual"].astype(int).to_numpy()
+
+    min_samples = max(25, len(feature_columns) * 3)
+    if len(feature_df) < min_samples:
+        LOGGER.debug(
+            "Meta-model requires at least %d samples; received %d. Skipping.",
+            min_samples,
+            len(feature_df),
+        )
+        return None
+
+    meta_pipeline = Pipeline(
+        steps=[
+            ("impute", SimpleImputer(strategy="median")),
+            ("scale", StandardScaler()),
+            (
+                "model",
+                LogisticRegression(max_iter=2000, solver="lbfgs", penalty="l2", C=0.5),
+            ),
+        ]
+    )
+
+    meta_pipeline.fit(feature_df, y)
+
+    try:
+        meta_proba = meta_pipeline.predict_proba(feature_df)
+        stacked_metrics = _compute_classification_metrics(y, meta_proba)
+        LOGGER.debug(
+            "Meta-model training complete: log_loss=%.4f accuracy=%.3f",
+            stacked_metrics.get("log_loss", float("nan")),
+            stacked_metrics.get("accuracy", float("nan")),
+        )
+    except Exception:  # pragma: no cover - diagnostics only
+        LOGGER.debug("Meta-model diagnostics unavailable; skipping metric logging.")
+
+    return MoneylineMetaModel(
+        model=meta_pipeline,
+        feature_columns=feature_columns,
+        prob_columns=prob_columns,
+        context_columns=context_cols,
+        aggregate_columns=_META_AGGREGATE_FEATURES.copy(),
+    )
 
 
 def train_total_models(

@@ -241,6 +241,73 @@ def _apply_calibration(result: models.ModelResult, raw_prob: float) -> float:
     return float(np.clip(raw_prob, 1e-6, 1 - 1e-6))
 
 
+def _moneyline_model_weights(results: Sequence[models.ModelResult]) -> list[float]:
+    if not results:
+        return []
+
+    raw_weights: list[float] = []
+    for result in results:
+        score = None
+        metrics = result.calibrated_metrics or {}
+        loss = metrics.get("calibrated_log_loss") if metrics else None
+        if loss is None:
+            metrics = result.metrics or {}
+            loss = metrics.get("log_loss") if metrics else None
+        if loss is not None and loss > 0:
+            score = 1.0 / float(loss)
+        if score is None:
+            metrics = result.calibrated_metrics or result.metrics or {}
+            accuracy = None
+            if metrics:
+                accuracy = metrics.get("calibrated_accuracy") or metrics.get("accuracy")
+            if accuracy is not None and accuracy > 0:
+                score = float(accuracy)
+        if score is None:
+            score = 1.0
+        raw_weights.append(score)
+
+    total = float(sum(raw_weights))
+    if total <= 0:
+        return [1.0 / len(raw_weights)] * len(raw_weights)
+    return [weight / total for weight in raw_weights]
+
+
+def _build_meta_feature_row(
+    bundle: models.MoneylineMetaModel,
+    prob_lookup: dict[str, float],
+    base_context: dict[str, float | int | str | None],
+) -> pd.DataFrame:
+    """Construct a single-row DataFrame aligned with the meta-model schema."""
+
+    row: dict[str, float | int | str | None] = {}
+    for col in bundle.prob_columns:
+        model_key = col.removesuffix("_prob")
+        value = prob_lookup.get(model_key, np.nan)
+        row[col] = value if value is not None else np.nan
+
+    for ctx in bundle.context_columns:
+        ctx_value = base_context.get(ctx, np.nan)
+        row[ctx] = ctx_value if ctx_value is not None else np.nan
+
+    prob_values = [row[col] for col in bundle.prob_columns if pd.notna(row[col])]
+    if prob_values:
+        row["prob_mean"] = float(np.mean(prob_values))
+        row["prob_std"] = float(np.std(prob_values, ddof=0))
+        row["prob_max"] = float(np.max(prob_values))
+        row["prob_min"] = float(np.min(prob_values))
+        row["prob_range"] = float(row["prob_max"] - row["prob_min"])
+    else:
+        for agg_col in bundle.aggregate_columns:
+            row[agg_col] = np.nan
+
+    for agg_col in bundle.aggregate_columns:
+        row.setdefault(agg_col, np.nan)
+
+    # Ensure every expected feature is present in consistent order.
+    ordered_row = {col: row.get(col, np.nan) for col in bundle.feature_columns}
+    return pd.DataFrame([ordered_row])
+
+
 def predict_upcoming_games(
     *,
     team_df: pd.DataFrame,
@@ -280,6 +347,9 @@ def predict_upcoming_games(
         return pd.DataFrame()
 
     predictions: list[dict[str, float | int | str | None]] = []
+    ensemble_weights = _moneyline_model_weights(moneyline_results)
+    meta_model_bundle = models.train_moneyline_meta_model(moneyline_results)
+
     for row in upcoming.itertuples(index=False):
         custom_row = build_custom_matchup_row(
             team_df,
@@ -307,10 +377,35 @@ def predict_upcoming_games(
             "away_travel_miles": getattr(row, "away_travel_miles", np.nan),
         }
 
-        home_probs_raw: list[float] = []
-        home_probs_calibrated: list[float] = []
+        base["home_market_prob"] = moneyline_to_prob(base["home_moneyline"])
+        base["away_market_prob"] = moneyline_to_prob(base["away_moneyline"])
 
-        for result in moneyline_results:
+        home_rest = base["home_rest_days"]
+        away_rest = base["away_rest_days"]
+        if pd.notna(home_rest) and pd.notna(away_rest):
+            base["rest_days_diff"] = float(home_rest) - float(away_rest)
+        else:
+            base["rest_days_diff"] = np.nan
+
+        home_travel = base["home_travel_miles"]
+        away_travel = base["away_travel_miles"]
+        if pd.notna(home_travel) and pd.notna(away_travel):
+            base["travel_miles_diff"] = float(home_travel) - float(away_travel)
+        else:
+            base["travel_miles_diff"] = np.nan
+
+        model_weights = (
+            ensemble_weights
+            if ensemble_weights
+            else ([1.0 / len(moneyline_results)] * len(moneyline_results) if moneyline_results else [])
+        )
+        weighted_home_raw = 0.0
+        weighted_home_calibrated = 0.0
+        raw_prob_list: list[float] = []
+        calibrated_prob_list: list[float] = []
+        calibrated_lookup: dict[str, float] = {}
+
+        for weight, result in zip(model_weights, moneyline_results):
             model = result.model
             try:
                 raw_prob = float(model.predict_proba(feature_frame)[0][1])
@@ -320,8 +415,24 @@ def predict_upcoming_games(
             base[f"{result.model_name}_home_win_raw"] = raw_prob
             base[f"{result.model_name}_home_win"] = calibrated_prob
             base[f"{result.model_name}_away_win"] = 1 - calibrated_prob
-            home_probs_raw.append(raw_prob)
-            home_probs_calibrated.append(calibrated_prob)
+            base[f"{result.model_name}_weight"] = float(weight)
+            weighted_home_raw += weight * raw_prob
+            weighted_home_calibrated += weight * calibrated_prob
+            raw_prob_list.append(raw_prob)
+            calibrated_prob_list.append(calibrated_prob)
+            calibrated_lookup[result.model_name] = calibrated_prob
+
+        if meta_model_bundle is not None and calibrated_lookup:
+            meta_features_df = _build_meta_feature_row(meta_model_bundle, calibrated_lookup, base)
+            try:
+                stacked_prob = float(meta_model_bundle.model.predict_proba(meta_features_df)[0][1])
+            except AttributeError:
+                stacked_prob = float(meta_model_bundle.model.predict(meta_features_df)[0])
+            base["stacked_home_win_prob"] = stacked_prob
+            base["stacked_away_win_prob"] = float(1 - stacked_prob)
+            for col in meta_model_bundle.aggregate_columns:
+                if col in meta_features_df.columns:
+                    base[f"meta_{col}"] = float(meta_features_df.iloc[0][col])
 
         total_preds: list[float] = []
         total_stds: list[float] = []
@@ -352,21 +463,44 @@ def predict_upcoming_games(
             base["ensemble_total_p25"] = float(avg_total - quartile_offset)
             base["ensemble_total_p75"] = float(avg_total + quartile_offset)
 
-        if home_probs_raw:
-            avg_home_raw = float(np.mean(home_probs_raw))
+        if raw_prob_list:
+            if model_weights:
+                avg_home_raw = float(weighted_home_raw)
+            else:
+                avg_home_raw = float(np.mean(raw_prob_list))
             base["avg_home_win_prob_raw"] = avg_home_raw
             base["avg_away_win_prob_raw"] = float(1 - avg_home_raw)
-        if home_probs_calibrated:
-            avg_home = float(np.mean(home_probs_calibrated))
+        if calibrated_prob_list:
+            if model_weights:
+                avg_home = float(weighted_home_calibrated)
+            else:
+                avg_home = float(np.mean(calibrated_prob_list))
             avg_away = float(1 - avg_home)
             base["avg_home_win_prob"] = avg_home
             base["avg_away_win_prob"] = avg_away
-            if avg_home >= 0.5:
+
+        final_home_prob = None
+        stacked_home = base.get("stacked_home_win_prob")
+        if stacked_home is not None and pd.notna(stacked_home):
+            final_home_prob = float(stacked_home)
+            base["ensemble_method"] = "stacked_meta"
+        elif base.get("avg_home_win_prob") is not None and pd.notna(base.get("avg_home_win_prob")):
+            final_home_prob = float(base["avg_home_win_prob"])
+            base["ensemble_method"] = "weighted_average"
+        elif base.get("avg_home_win_prob_raw") is not None and pd.notna(base.get("avg_home_win_prob_raw")):
+            final_home_prob = float(base["avg_home_win_prob_raw"])
+            base["ensemble_method"] = "weighted_average_raw"
+
+        if final_home_prob is not None:
+            final_away_prob = float(1 - final_home_prob)
+            base["ensemble_home_win_prob"] = final_home_prob
+            base["ensemble_away_win_prob"] = final_away_prob
+            if final_home_prob >= 0.5:
                 base["predicted_winner"] = row.home_team
-                base["predicted_win_prob"] = avg_home
+                base["predicted_win_prob"] = final_home_prob
             else:
                 base["predicted_winner"] = row.away_team
-                base["predicted_win_prob"] = avg_away
+                base["predicted_win_prob"] = final_away_prob
 
         predictions.append(base)
 
